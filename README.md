@@ -1,2 +1,0 @@
-# Magnetoo-Semmaris
-Dashboard Semmaris
