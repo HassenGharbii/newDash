@@ -1,0 +1,25 @@
+# Node / Front
+node_modules/
+dist/
+build/
+.cache/
+.next/
+.out/
+coverage/
+*.log
+
+# Backend (Node/Python)
+venv/
+.env
+*.pyc
+__pycache__/
+
+# Docker
+*.pid
+*.sock
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

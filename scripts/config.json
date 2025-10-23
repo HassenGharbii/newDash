@@ -1,0 +1,8 @@
+{
+  "apiBase": "http://localhost:4000",
+  "adminEmail": "admin@semmaris.local",
+  "adminPassword": "admin123",
+  "ingestKey": "change-me-strong",
+  "timeoutMs": 2000,
+  "count": 1
+}
