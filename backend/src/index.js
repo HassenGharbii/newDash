@@ -218,14 +218,16 @@ const validate = (schema) => (req, res, next) => {
   next();
 };
 
-const ALLOWED_TYPES = ['Camera','Switch','Server','PC'];
+const ALLOWED_TYPES = ['Camera','Switch','Server','PC','Hyperviseur','Stockage'];
 const normType = (t)=>{
   const s = (t||'').toString().trim().toLowerCase();
   if (s.startsWith('serv')) return 'Server';
   if (s.startsWith('sw')) return 'Switch';
   if (s.startsWith('cam')) return 'Camera';
   if (s === 'pc') return 'PC';
-  if (['server','switch','camera','pc'].includes(s)) return s[0].toUpperCase()+s.slice(1);
+  if (s === 'hyperviseur' || s === 'hypervisor' || s === 'esxi' || s === 'vmware') return 'Hyperviseur';
+  if (s === 'stockage' || s === 'storage' || s === 'baie' || s === 'san' || s === 'nas') return 'Stockage';
+  if (['server','switch','camera','pc','hyperviseur','stockage'].includes(s)) return s[0].toUpperCase()+s.slice(1);
   return 'PC';
 };
 function ensureTypeOr400(res, type) {
@@ -238,6 +240,7 @@ function ensureTypeOr400(res, type) {
 
 const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = OFF');
 
 // ---------- SCHEMA & MIGRATIONS ----------
 db.exec(`
@@ -245,7 +248,7 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('Admin','User')),
+  role TEXT NOT NULL CHECK (role IN ('Admin','User','SGM')),
   name TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -253,7 +256,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS equipment (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('Camera','Switch','Server','PC')),
+  type TEXT NOT NULL,
   ip TEXT,
   model TEXT,
   location TEXT,
@@ -272,8 +275,8 @@ CREATE TABLE IF NOT EXISTS bandwidth_data (
   value_mbps REAL NOT NULL CHECK (value_mbps >= 0),
   interface_name TEXT DEFAULT 'main',
   equipment_id INTEGER,
-  created_at TEXT DEFAULT (datetime('now')),
-  FOREIGN KEY (equipment_id) REFERENCES equipment(id) ON DELETE SET NULL
+  equipment_type TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
 );
 
 -- Enhanced indexes for better performance
@@ -291,15 +294,53 @@ CREATE INDEX IF NOT EXISTS idx_bandwidth_equipment ON bandwidth_data(equipment_i
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
--- Trigger to update equipment updated_at
-DROP TRIGGER IF EXISTS update_equipment_timestamp;
-CREATE TRIGGER update_equipment_timestamp 
-  AFTER UPDATE ON equipment 
-  FOR EACH ROW 
-BEGIN
-  UPDATE equipment SET updated_at = datetime('now') WHERE id = NEW.id;
-END;
+-- Equipment table ready
 `);
+
+// ---------- MIGRATIONS ----------
+// Add equipment_type column to bandwidth_data if it doesn't exist
+const bandwidthColumns = db.prepare("PRAGMA table_info(bandwidth_data)").all();
+const hasEquipmentType = bandwidthColumns.some(col => col.name === 'equipment_type');
+if (!hasEquipmentType) {
+  logger.info('Adding equipment_type column to bandwidth_data table');
+  db.prepare('ALTER TABLE bandwidth_data ADD COLUMN equipment_type TEXT').run();
+}
+
+// Migration V3: Remove restrictive CHECK constraint on equipment.type to allow Hyperviseur and Stockage
+const equipSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='equipment'").get();
+if (equipSchema && equipSchema.sql && equipSchema.sql.includes("'Camera','Switch','Server','PC'")) {
+  logger.info('Migration V3: Rebuilding equipment table to support Hyperviseur and Stockage types');
+  db.exec(`
+    PRAGMA foreign_keys=OFF;
+    BEGIN TRANSACTION;
+    CREATE TABLE equipment_v3 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      ip TEXT,
+      model TEXT,
+      location TEXT,
+      ping_status TEXT DEFAULT 'UNKNOWN' CHECK (ping_status IN ('UP','DOWN','UNKNOWN')),
+      latency_ms INTEGER CHECK (latency_ms >= 0),
+      last_ping_at TEXT,
+      last_info_at TEXT,
+      info_json TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    INSERT INTO equipment_v3 SELECT * FROM equipment;
+    DROP TABLE equipment;
+    ALTER TABLE equipment_v3 RENAME TO equipment;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_equipment_ip_unique ON equipment(ip) WHERE ip IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_equipment_type ON equipment(type);
+    CREATE INDEX IF NOT EXISTS idx_equipment_status ON equipment(ping_status);
+    CREATE INDEX IF NOT EXISTS idx_equipment_name ON equipment(name);
+    CREATE INDEX IF NOT EXISTS idx_equipment_search ON equipment(name, ip, model, location);
+    COMMIT;
+    PRAGMA foreign_keys=ON;
+  `);
+  logger.info('Migration V3 complete: equipment table now supports Hyperviseur and Stockage types');
+}
 
 // ---------- SEED ----------
 const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
@@ -314,7 +355,7 @@ if (userCount === 0) {
 
 // ---------- AUTH ----------
 const sign = (user) =>
-  jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name || null }, config.jwtSecret, { expiresIn: '12h' });
+  jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.name || null }, config.jwtSecret, { expiresIn: '30d' });
 
 const auth = (roles = []) => {
   if (typeof roles === 'string') roles = [roles];
@@ -370,7 +411,15 @@ app.post('/auth/login', validate({
   res.json({ token, user: { id: user.id, email: user.email, role: user.role, name: user.name || null }});
 }));
 
-app.get('/auth/me', auth(['Admin','User']), (req,res)=>{
+// Endpoint pour rafraîchir le token (sans mot de passe)
+app.post('/auth/refresh', auth(['Admin','User','SGM']), (req,res)=>{
+  const user = req.user;
+  const newToken = sign(user);
+  logger.info('Token refreshed', { userId: user.id, role: user.role });
+  res.json({ token: newToken, user: { id: user.id, email: user.email, role: user.role, name: user.name || null }});
+});
+
+app.get('/auth/me', auth(['Admin','User','SGM']), (req,res)=>{
   res.json({ user: { id: req.user.id, email: req.user.email, role: req.user.role, name: req.user.name || null } });
 });
 
@@ -393,7 +442,7 @@ app.post('/users', auth('Admin'), (req,res)=>{
     if (!email || !password || !role || !name) {
       return res.status(400).json({ error: 'email, password, role, name required' });
     }
-    if (!['Admin','User'].includes(role)) {
+    if (!['Admin','User','SGM'].includes(role)) {
       return res.status(400).json({ error: 'invalid role' });
     }
     const hash = bcrypt.hashSync(password, 10);
@@ -418,7 +467,7 @@ app.put('/users/:id', auth('Admin'), (req,res)=>{
   try {
     const { id } = req.params;
     const { email, password, role, name } = req.body || {};
-    if (role && !['Admin','User'].includes(role)) {
+    if (role && !['Admin','User','SGM'].includes(role)) {
       return res.status(400).json({ error: 'invalid role' });
     }
     const user = db.prepare('SELECT id FROM users WHERE id=?').get(id);
@@ -450,44 +499,9 @@ app.delete('/users/:id', auth('Admin'), (req,res)=>{
 
 // ---------- EQUIPMENT (CRUD + SEARCH) ----------
 
-// GET /equipment
-// Liste les équipements, du plus récent au plus ancien.
-// Paramètre optionnel ?limit (borné 1..200).
-app.get('/equipment', auth(['Admin','User']), (req, res) => {
-  try {
-    const rawLimit = parseInt((req.query.limit ?? '').toString(), 10);
-    const limitParam = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : null;
 
-    const rawPage = parseInt((req.query.page ?? '').toString(), 10);
-    const rawPageSize = parseInt((req.query.pageSize ?? '').toString(), 10);
-    const hasPaging = Number.isFinite(rawPage) || Number.isFinite(rawPageSize);
 
-    if (!hasPaging) {
-      // mode historique (array) + support ?limit
-      let sql = 'SELECT * FROM equipment ORDER BY id DESC';
-      const params = [];
-      if (limitParam !== null) { sql += ' LIMIT ?'; params.push(limitParam); }
-      const rows = params.length ? db.prepare(sql).all(...params) : db.prepare(sql).all();
-      return res.json(rows.map(r => ({ ...r, info_json: r.info_json ? JSON.parse(r.info_json) : null })));
-    }
-
-    // mode pagination
-    const pageSize = Math.min(Math.max(Number.isFinite(rawPageSize)?rawPageSize:10, 1), 200);
-    const page = Math.max(Number.isFinite(rawPage)?rawPage:1, 1);
-    const offset = (page-1)*pageSize;
-
-    const total = db.prepare('SELECT COUNT(*) as c FROM equipment').get().c;
-    const items = db.prepare('SELECT * FROM equipment ORDER BY id DESC LIMIT ? OFFSET ?').all(pageSize, offset)
-      .map(r => ({ ...r, info_json: r.info_json ? JSON.parse(r.info_json) : null }));
-
-    res.json({ items, page, pageSize, total });
-  } catch (e) {
-    console.error('GET /equipment error:', e);
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-app.get('/equipment/search', auth(['Admin','User']), (req,res)=>{
+app.get('/equipment/search', auth(['Admin','User','SGM']), (req,res)=>{
   try {
     const q = (req.query.q || '').toString().trim();
     const t = (req.query.type || '').toString().trim();
@@ -535,14 +549,34 @@ app.post('/equipment', auth('Admin'), (req,res)=>{
     if (!name || !type) return res.status(400).json({ error: 'name & type required' });
     const finalType = normType(type);
     if (!ensureTypeOr400(res, finalType)) return;
+    
+    // Stratégie UPSERT : chercher par IP ou par nom
+    let existing = null;
+    
+    // Priorité 1 : chercher par IP si fournie
+    if (ip && ip.trim()) {
+      existing = db.prepare('SELECT id FROM equipment WHERE ip = ?').get(ip.trim());
+    }
+    
+    // Priorité 2 : chercher par nom si pas trouvé par IP
+    if (!existing && name && name.trim()) {
+      existing = db.prepare('SELECT id FROM equipment WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))').get(name.trim());
+    }
+    
+    // Si équipement existe : UPDATE
+    if (existing) {
+      db.prepare(
+        'UPDATE equipment SET name=?, type=?, ip=?, model=?, location=? WHERE id=?'
+      ).run(name.trim(), finalType, ip?.trim()||null, model?.trim()||null, location?.trim()||null, existing.id);
+      return res.json({ id: existing.id, updated: true });
+    }
+    
+    // Si équipement n'existe pas : INSERT
     const info = db.prepare(
       'INSERT INTO equipment (name,type,ip,model,location) VALUES (?,?,?,?,?)'
-    ).run(name.trim(), finalType, ip||null, model||null, location||null);
-    res.json({ id: info.lastInsertRowid });
+    ).run(name.trim(), finalType, ip?.trim()||null, model?.trim()||null, location?.trim()||null);
+    res.json({ id: info.lastInsertRowid, inserted: true });
   } catch (e) {
-    if (String(e).includes('UNIQUE') && String(e).includes('idx_equipment_ip_unique')) {
-      return res.status(409).json({ error: 'ip already exists' });
-    }
     console.error('POST /equipment error:', e);
     res.status(500).json({ error: 'internal_error' });
   }
@@ -555,6 +589,22 @@ app.put('/equipment/:id', auth('Admin'), (req,res)=>{
     if (!row) return res.status(404).json({ error: 'not found' });
 
     const payload = req.body || {};
+    
+    // Vérifier les doublons par IP ou nom avant modification (sauf pour l'équipement en cours)
+    if (payload.ip && payload.ip.trim()) {
+      const existingIp = db.prepare('SELECT id FROM equipment WHERE ip = ? AND id != ?').get(payload.ip.trim(), id);
+      if (existingIp) {
+        return res.status(409).json({ error: 'duplicate_ip', message: 'Un équipement avec cette IP existe déjà' });
+      }
+    }
+    
+    if (payload.name && payload.name.trim()) {
+      const existingName = db.prepare('SELECT id FROM equipment WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) AND id != ?').get(payload.name.trim(), id);
+      if (existingName) {
+        return res.status(409).json({ error: 'duplicate_name', message: 'Un équipement avec ce nom existe déjà' });
+      }
+    }
+    
     const fields = ['name','type','ip','model','location','ping_status','latency_ms','last_ping_at','last_info_at','info_json'];
     const updates = [];
     const params = [];
@@ -566,6 +616,9 @@ app.put('/equipment/:id', auth('Admin'), (req,res)=>{
           updates.push(`type=?`); params.push(t);
         } else if (f === 'info_json' && payload[f] && typeof payload[f] === 'object') {
           updates.push(`info_json=?`); params.push(JSON.stringify(payload[f]));
+        } else if (f === 'name' || f === 'ip' || f === 'model' || f === 'location') {
+          // Trim les champs texte
+          updates.push(`${f}=?`); params.push(payload[f]?.trim() || null);
         } else {
           updates.push(`${f}=?`); params.push(payload[f]);
         }
@@ -577,9 +630,6 @@ app.put('/equipment/:id', auth('Admin'), (req,res)=>{
     db.prepare(`UPDATE equipment SET ${updates.join(', ')} WHERE id=?`).run(...params);
     res.json({ ok: true });
   } catch (e) {
-    if (String(e).includes('UNIQUE') && String(e).includes('idx_equipment_ip_unique')) {
-      return res.status(409).json({ error: 'ip already exists' });
-    }
     console.error('PUT /equipment/:id error:', e);
     res.status(500).json({ error: 'internal_error' });
   }
@@ -587,10 +637,101 @@ app.put('/equipment/:id', auth('Admin'), (req,res)=>{
 
 app.delete('/equipment/:id', auth('Admin'), (req,res)=>{
   try {
-    db.prepare('DELETE FROM equipment WHERE id=?').run(req.params.id);
-    res.json({ ok: true });
+    const id = req.params.id;
+    
+    // Supprimer les entrées de bandwidth_data associées (au lieu de les mettre à NULL)
+    db.prepare('DELETE FROM bandwidth_data WHERE equipment_id = ?').run(id);
+    
+    // Puis supprimer l'équipement
+    const result = db.prepare('DELETE FROM equipment WHERE id=?').run(id);
+    
+    res.json({ ok: true, deleted: result.changes });
   } catch (e) {
     console.error('DELETE /equipment/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- BULK DELETE ----------
+app.post('/equipment/bulk-delete', auth('Admin'), (req,res)=>{
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    logger.info(`Bulk delete request received`, { ids, idsType: typeof ids, idsLength: ids.length });
+    
+    if (ids.length === 0) {
+      return res.status(400).json({ error: 'no_ids_provided' });
+    }
+    
+    // Validate IDs are numbers - convert strings to integers if needed
+    const validIds = ids
+      .map(id => typeof id === 'string' ? parseInt(id, 10) : id)
+      .filter(id => Number.isInteger(id) && id > 0);
+    
+    logger.info(`Valid IDs after filtering`, { validIds, count: validIds.length });
+    
+    if (validIds.length === 0) {
+      return res.status(400).json({ error: 'invalid_ids', message: 'Aucun ID valide fourni' });
+    }
+    
+    // Nettoyer les références dans bandwidth_data AVANT de supprimer les équipements
+    const placeholders = validIds.map(() => '?').join(',');
+    
+    // Supprimer les entrées de bandwidth_data associées (plutôt que de les mettre à NULL)
+    db.prepare(`DELETE FROM bandwidth_data WHERE equipment_id IN (${placeholders})`).run(...validIds);
+    
+    // Maintenant on peut supprimer les équipements en toute sécurité
+    const stmt = db.prepare(`DELETE FROM equipment WHERE id IN (${placeholders})`);
+    const result = stmt.run(...validIds);
+    
+    logger.info(`Bulk delete: ${result.changes} equipment(s) deleted`, { ids: validIds });
+    res.json({ ok: true, deleted: result.changes });
+  } catch (e) {
+    logger.error('POST /equipment/bulk-delete error:', e);
+    res.status(500).json({ error: 'internal_error', message: e.message });
+  }
+});
+
+app.delete('/equipment/delete-by-type/:type', auth('Admin'), (req,res)=>{
+  try {
+    const type = req.params.type;
+    if (!ALLOWED_TYPES.includes(type)) {
+      return res.status(400).json({ error: 'invalid_type' });
+    }
+    
+    // Récupérer les IDs à supprimer
+    const equipmentIds = db.prepare('SELECT id FROM equipment WHERE type = ?').all(type).map(e => e.id);
+    
+    if (equipmentIds.length === 0) {
+      return res.json({ ok: true, deleted: 0 });
+    }
+    
+    // Supprimer les bandwidth_data associées
+    const placeholders = equipmentIds.map(() => '?').join(',');
+    db.prepare(`DELETE FROM bandwidth_data WHERE equipment_id IN (${placeholders})`).run(...equipmentIds);
+    
+    // Supprimer les équipements
+    const result = db.prepare('DELETE FROM equipment WHERE type = ?').run(type);
+    
+    logger.info(`Delete by type "${type}": ${result.changes} equipment(s) deleted`);
+    res.json({ ok: true, deleted: result.changes });
+  } catch (e) {
+    logger.error('DELETE /equipment/delete-by-type error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.delete('/equipment/delete-all', auth('Admin'), (req,res)=>{
+  try {
+    // Supprimer toutes les bandwidth_data
+    db.prepare('DELETE FROM bandwidth_data').run();
+    
+    // Supprimer tous les équipements
+    const result = db.prepare('DELETE FROM equipment').run();
+    
+    logger.info(`Delete all: ${result.changes} equipment(s) deleted`);
+    res.json({ ok: true, deleted: result.changes });
+  } catch (e) {
+    logger.error('DELETE /equipment/delete-all error:', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -697,16 +838,59 @@ app.get('/equipment/template-excel', auth(['Admin','User']), (_req,res)=>{
   }
 });
 
+app.get('/equipment/export-excel', auth(['Admin']), (_req,res)=>{
+  try {
+    // Récupérer tous les équipements
+    const equipment = db.prepare('SELECT name, ip, type, model, location FROM equipment ORDER BY type, name').all();
+    
+    // Préparer les données pour Excel
+    const headers = ['name','ip','type','model','location'];
+    const rows = equipment.map(e => [e.name, e.ip || '', e.type, e.model || '', e.location || '']);
+    const data = [headers, ...rows];
+    
+    // Créer le fichier Excel
+    const ws = XLSX.utils.aoa_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Equipements');
+    const buf = XLSX.write(wb, { type:'buffer', bookType:'xlsx' });
+    
+    res.setHeader('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition','attachment; filename="equipements-export.xlsx"');
+    res.send(buf);
+    
+    logger.info(`Equipment export: ${equipment.length} items exported`);
+  } catch (e) {
+    console.error('GET /equipment/export-excel error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ---------- INGEST (PING) ----------
 app.post('/ingest/ping', requireIngestKey, (req,res)=>{
   try {
     const { ip, status, latency_ms } = req.body || {};
     if (!ip) return res.status(400).json({ error: 'ip required' });
-    const row = db.prepare('SELECT id FROM equipment WHERE ip=?').get(ip);
-    if (!row) return res.status(404).json({ error: 'not found' });
+    
+    // Nettoyer l'IP reçue (enlever port si présent)
+    const cleanIp = ip.replace(/:\d+$/, '');
+    
+    // Chercher l'équipement par IP exacte OU par IP avec port
+    const row = db.prepare(`
+      SELECT id FROM equipment 
+      WHERE ip = ? OR ip = ? OR REPLACE(ip, SUBSTR(ip, INSTR(ip, ':')), '') = ?
+    `).get(ip, cleanIp, cleanIp);
+    
+    if (!row) {
+      console.log(`[WARN] /ingest/ping - Équipement non trouvé pour IP: ${ip} (clean: ${cleanIp})`);
+      return res.status(404).json({ error: 'not found' });
+    }
+    
     const now = new Date().toISOString().slice(0,19).replace('T',' ');
-    db.prepare('UPDATE equipment SET ping_status=?, latency_ms=?, last_ping_at=? WHERE ip=?')
-      .run((status||'').toString().toUpperCase()==='UP'?'UP':'DOWN', Number(latency_ms)||null, now, ip);
+    const pingStatus = (status||'').toString().toUpperCase()==='UP'?'UP':'DOWN';
+    
+    db.prepare('UPDATE equipment SET ping_status=?, latency_ms=?, last_ping_at=? WHERE id=?')
+      .run(pingStatus, Number(latency_ms)||null, now, row.id);
+    
     res.json({ ok:true });
   } catch (e) {
     console.error('POST /ingest/ping error:', e);
@@ -714,22 +898,299 @@ app.post('/ingest/ping', requireIngestKey, (req,res)=>{
   }
 });
 
+// ---------- INGEST (PING BATCH) ----------
+app.post('/ingest/ping/batch', requireIngestKey, (req,res)=>{
+  try {
+    const { results } = req.body || {};
+    if (!Array.isArray(results)) {
+      return res.status(400).json({ error: 'results array required' });
+    }
+    
+    const now = new Date().toISOString().slice(0,19).replace('T',' ');
+    let updated = 0;
+    let notFound = 0;
+    
+    // Utiliser une transaction pour mettre à jour tous les résultats d'un coup
+    const updateMany = db.transaction((pingResults) => {
+      for (const result of pingResults) {
+        const { ip, status, latency_ms } = result;
+        if (!ip) continue;
+        
+        // Nettoyer l'IP
+        const cleanIp = ip.replace(/:\d+$/, '');
+        
+        // Chercher l'équipement
+        const row = db.prepare(`
+          SELECT id FROM equipment 
+          WHERE ip = ? OR ip = ? OR REPLACE(ip, SUBSTR(ip, INSTR(ip, ':')), '') = ?
+        `).get(ip, cleanIp, cleanIp);
+        
+        if (!row) {
+          notFound++;
+          continue;
+        }
+        
+        const pingStatus = (status||'').toString().toUpperCase()==='UP'?'UP':'DOWN';
+        
+        db.prepare('UPDATE equipment SET ping_status=?, latency_ms=?, last_ping_at=? WHERE id=?')
+          .run(pingStatus, Number(latency_ms)||null, now, row.id);
+        
+        updated++;
+      }
+    });
+    
+    // Exécuter la transaction
+    updateMany(results);
+    
+    console.log(`[INFO] /ingest/ping/batch - ${updated} équipements mis à jour, ${notFound} non trouvés`);
+    res.json({ ok: true, updated, notFound, total: results.length });
+  } catch (e) {
+    console.error('POST /ingest/ping/batch error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- INGEST (SERVER INFO) ----------
+app.post('/ingest/server', requireIngestKey, (req,res)=>{
+  try {
+    const { equipment_id, hostname, ip, os_name, os_version, cpu_model, cpu_cores, 
+            cpu_usage_percent, memory_total_gb, memory_used_gb, memory_usage_percent,
+            uptime_hours, temperature_celsius, disks, services_count, status, last_check } = req.body || {};
+    
+    if (!equipment_id && !ip) {
+      return res.status(400).json({ error: 'equipment_id or ip required' });
+    }
+    
+    // Trouver l'équipement par ID ou IP
+    let row;
+    if (equipment_id) {
+      row = db.prepare('SELECT id FROM equipment WHERE id=? AND type=?').get(equipment_id, 'Server');
+    } else if (ip) {
+      row = db.prepare('SELECT id FROM equipment WHERE ip=? AND type=?').get(ip, 'Server');
+    }
+    
+    if (!row) {
+      return res.status(404).json({ error: 'server not found' });
+    }
+    
+    const now = new Date().toISOString().slice(0,19).replace('T',' ');
+    
+    // Construire l'objet info_json avec la structure attendue par le frontend
+    const serverInfo = {
+      hostname,
+      os_name,
+      os_version,
+      uptime_hours,
+      last_check: last_check || now,
+      // CPU
+      cpu: {
+        model: cpu_model,
+        cores: cpu_cores,
+        usage: cpu_usage_percent || 0,
+        temperature: temperature_celsius || 0
+      },
+      // Mémoire
+      memory: {
+        total_gb: memory_total_gb || 0,
+        used_gb: memory_used_gb || 0,
+        usage_percent: memory_usage_percent || 0
+      },
+      // Disques
+      disks: disks || [],
+      // GPU (placeholder - sera rempli si disponible)
+      gpu: {
+        usage: 0,
+        temperature: 0,
+        memory: 0
+      },
+      // Alimentation (placeholder)
+      power: {
+        voltage: 230,
+        current: 2.5,
+        status: 'normal'
+      },
+      // Bande passante (placeholder)
+      bandwidth: {
+        current: 0,
+        max: 1000
+      },
+      services_count: services_count || 0
+    };
+    
+    // Mettre à jour l'équipement
+    db.prepare('UPDATE equipment SET ping_status=?, last_info_at=?, info_json=? WHERE id=?')
+      .run(status === 'online' ? 'UP' : 'DOWN', now, JSON.stringify(serverInfo), row.id);
+    
+    logger.info(`Server info updated for equipment ID ${row.id}`);
+    res.json({ ok: true, equipment_id: row.id });
+  } catch (e) {
+    console.error('POST /ingest/server error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- INGEST (SERVER METRICS - NEW FORMAT) ----------
+app.post('/ingest/server-metrics', requireIngestKey, (req,res)=>{
+  try {
+    const { server_id, server_name, metrics } = req.body || {};
+    
+    if (!server_id) {
+      return res.status(400).json({ error: 'server_id required' });
+    }
+    
+    // Vérifier que le serveur existe
+    const server = db.prepare('SELECT id FROM equipment WHERE id=? AND type=?').get(server_id, 'Server');
+    
+    if (!server) {
+      return res.status(404).json({ error: 'server not found' });
+    }
+    
+    const now = new Date().toISOString().slice(0,19).replace('T',' ');
+    
+    // Stocker les métriques dans info_json
+    db.prepare('UPDATE equipment SET last_info_at=?, info_json=? WHERE id=?')
+      .run(now, JSON.stringify(metrics), server.id);
+    
+    logger.info(`Server metrics updated for ${server_name} (ID: ${server.id})`);
+    res.json({ ok: true, server_id: server.id });
+  } catch (e) {
+    console.error('POST /ingest/server-metrics error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- INGEST (SWITCH METRICS - NEW FORMAT) ----------
+app.post('/ingest/switch-metrics', requireIngestKey, (req,res)=>{
+  try {
+    const { switch_id, switch_name, metrics } = req.body || {};
+    
+    if (!switch_id) {
+      return res.status(400).json({ error: 'switch_id required' });
+    }
+    
+    // Vérifier que le switch existe
+    const switchEquip = db.prepare('SELECT id FROM equipment WHERE id=? AND type=?').get(switch_id, 'Switch');
+    
+    if (!switchEquip) {
+      return res.status(404).json({ error: 'switch not found' });
+    }
+    
+    const now = new Date().toISOString().slice(0,19).replace('T',' ');
+    
+    // Stocker les métriques dans info_json
+    db.prepare('UPDATE equipment SET last_info_at=?, info_json=? WHERE id=?')
+      .run(now, JSON.stringify(metrics), switchEquip.id);
+    
+    logger.info(`Switch metrics updated for ${switch_name} (ID: ${switchEquip.id})`);
+    res.json({ ok: true, switch_id: switchEquip.id });
+  } catch (e) {
+    console.error('POST /ingest/switch-metrics error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- INGEST (SWITCH INFO) ----------
+app.post('/ingest/switch', requireIngestKey, (req,res)=>{
+  try {
+    const { equipment_id, ip, hostname, description, location, contact, uptime_hours,
+            vendor, cpu_usage_percent, memory_total_mb, memory_used_mb, memory_usage_percent,
+            temperature_celsius, interface_count, ports_up, ports_down, interfaces, status, last_check } = req.body || {};
+    
+    if (!equipment_id && !ip) {
+      return res.status(400).json({ error: 'equipment_id or ip required' });
+    }
+    
+    // Trouver l'équipement par ID ou IP
+    let row;
+    if (equipment_id) {
+      row = db.prepare('SELECT id FROM equipment WHERE id=? AND type=?').get(equipment_id, 'Switch');
+    } else if (ip) {
+      row = db.prepare('SELECT id FROM equipment WHERE ip=? AND type=?').get(ip, 'Switch');
+    }
+    
+    if (!row) {
+      return res.status(404).json({ error: 'switch not found' });
+    }
+    
+    const now = new Date().toISOString().slice(0,19).replace('T',' ');
+    
+    // Transformer les interfaces en ports pour le frontend
+    const ports = (interfaces || []).map((iface, index) => ({
+      id: `port_${row.id}_${index + 1}`,
+      name: iface.name || `Port ${index + 1}`,
+      status: iface.status || 'down',
+      speed: iface.speed_mbps ? `${iface.speed_mbps} Mbps` : '1000 Mbps',
+      type: 'Ethernet',
+      bandwidth_usage: Math.min(100, Math.round(Math.random() * 30)), // Calculer le vrai usage si disponible
+      current_bandwidth: iface.in_octets ? Math.round((iface.in_octets * 8) / 1000000) : 0,
+      max_bandwidth: iface.speed_mbps || 1000,
+      connected_device: null // Sera rempli si disponible via LLDP/CDP
+    }));
+    
+    // Construire l'objet info_json avec la structure attendue par le frontend
+    const switchInfo = {
+      hostname,
+      description,
+      vendor,
+      uptime_hours,
+      last_check: last_check || now,
+      // CPU
+      cpu: {
+        usage: cpu_usage_percent || 0,
+        temperature: temperature_celsius || 0
+      },
+      // Mémoire
+      memory: {
+        total_mb: memory_total_mb || 0,
+        used_mb: memory_used_mb || 0,
+        usage_percent: memory_usage_percent || 0
+      },
+      // Alimentation
+      power: {
+        voltage: 48, // PoE voltage
+        current: 15,
+        status: 'normal'
+      },
+      // Bande passante globale
+      bandwidth: {
+        current: 0,
+        max: (interface_count || 24) * 1000 // Capacité totale
+      },
+      // Ports
+      ports: ports,
+      interface_count: interface_count || ports.length,
+      ports_up: ports_up || ports.filter(p => p.status === 'up').length,
+      ports_down: ports_down || ports.filter(p => p.status === 'down').length
+    };
+    
+    // Mettre à jour l'équipement
+    db.prepare('UPDATE equipment SET ping_status=?, last_info_at=?, info_json=? WHERE id=?')
+      .run(status === 'online' ? 'UP' : 'DOWN', now, JSON.stringify(switchInfo), row.id);
+    
+    logger.info(`Switch info updated for equipment ID ${row.id} with ${ports.length} ports`);
+    res.json({ ok: true, equipment_id: row.id, ports_count: ports.length });
+  } catch (e) {
+    console.error('POST /ingest/switch error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ---------- STATS ----------
-app.get('/stats/overview', auth(['Admin','User']), (_req,res)=>{
+app.get('/stats/overview', auth(['Admin','User','SGM']), (_req,res)=>{
   try {
     const total = db.prepare('SELECT COUNT(*) as c FROM equipment').get().c;
     const up = db.prepare("SELECT COUNT(*) as c FROM equipment WHERE ping_status='UP'").get().c;
-    const down = db.prepare("SELECT COUNT(*) as c FROM equipment WHERE ping_status='DOWN'").get().c;
+    const down = db.prepare("SELECT COUNT(*) as c FROM equipment WHERE ping_status IN ('DOWN', 'UNKNOWN')").get().c;
 
     // totaux par type
     const byType = db.prepare('SELECT type, COUNT(*) as c FROM equipment GROUP BY type').all();
 
-    // UP/DOWN par type
+    // UP/DOWN par type (UNKNOWN traité comme DOWN)
     const byTypeUpDown = db.prepare(`
       SELECT
         type,
         SUM(CASE WHEN ping_status='UP' THEN 1 ELSE 0 END) AS up,
-        SUM(CASE WHEN ping_status='DOWN' THEN 1 ELSE 0 END) AS down
+        SUM(CASE WHEN ping_status IN ('DOWN', 'UNKNOWN') THEN 1 ELSE 0 END) AS down
       FROM equipment
       GROUP BY type
     `).all();
@@ -743,23 +1204,50 @@ app.get('/stats/overview', auth(['Admin','User']), (_req,res)=>{
 
 // ---------- BANDWIDTH API ----------
 // GET /bandwidth - Récupérer les données de bande passante (24h par défaut)
-app.get('/bandwidth', auth(['Admin','User']), (req, res) => {
+app.get('/bandwidth', auth(['Admin','User','SGM']), (req, res) => {
   try {
     const hours = parseInt(req.query.hours) || 24;
     const interface_name = req.query.interface || 'main';
+    const equipment_type = req.query.type; // Nouveau: filtrer par type d'équipement
+    const equipment_id = req.query.equipment_id; // Nouveau: filtrer par équipement spécifique
     
-    const stmt = db.prepare(`
+    let query = `
       SELECT 
-        datetime(timestamp) as timestamp,
-        value_mbps,
-        interface_name
-      FROM bandwidth_data 
-      WHERE interface_name = ? 
-        AND datetime(timestamp) >= datetime('now', '-${hours} hours')
-      ORDER BY timestamp ASC
-    `);
+        b.timestamp,
+        b.value_mbps,
+        b.interface_name,
+        b.equipment_id,
+        e.name as equipment_name,
+        e.type as equipment_type
+      FROM bandwidth_data b
+      LEFT JOIN equipment e ON b.equipment_id = e.id
+      WHERE datetime(b.timestamp) >= datetime('now', '-${hours} hours')
+    `;
     
-    const data = stmt.all(interface_name);
+    const params = [];
+    
+    // Filtrer par interface si spécifié
+    if (interface_name !== 'all') {
+      query += ` AND b.interface_name = ?`;
+      params.push(interface_name);
+    }
+    
+    // Filtrer par type d'équipement si spécifié
+    if (equipment_type) {
+      query += ` AND e.type = ?`;
+      params.push(equipment_type);
+    }
+    
+    // Filtrer par équipement spécifique si spécifié
+    if (equipment_id) {
+      query += ` AND b.equipment_id = ?`;
+      params.push(parseInt(equipment_id));
+    }
+    
+    query += ` ORDER BY b.timestamp ASC`;
+    
+    const stmt = db.prepare(query);
+    const data = stmt.all(...params);
     res.json(data);
   } catch (e) {
     console.error('GET /bandwidth error:', e);
@@ -806,59 +1294,158 @@ app.post('/bandwidth/ingest', (req, res) => {
       return res.status(401).json({ error: 'invalid_api_key' });
     }
     
-    const { value_mbps, interface_name = 'main', timestamp } = req.body;
+    // Support ancien format (value_mbps) et nouveau format (equipment_id + bandwidth)
+    const { 
+      value_mbps, 
+      interface_name = 'main', 
+      timestamp,
+      equipment_id,
+      equipment_name,
+      equipment_type,
+      bandwidth
+    } = req.body;
     
-    if (typeof value_mbps !== 'number' || value_mbps < 0) {
-      return res.status(400).json({ error: 'value_mbps must be a positive number' });
+    const finalTimestamp = timestamp || bandwidth?.timestamp || new Date().toISOString();
+    
+    // Si equipment_name est fourni sans equipment_id, on le résout
+    let resolvedEquipmentId = equipment_id;
+    if (!resolvedEquipmentId && equipment_name) {
+      const equipmentLookup = db.prepare(`SELECT id FROM equipment WHERE name = ?`).get(equipment_name);
+      if (equipmentLookup) {
+        resolvedEquipmentId = equipmentLookup.id;
+      }
     }
     
-    const finalTimestamp = timestamp || new Date().toISOString();
-    
-    const stmt = db.prepare(`
-      INSERT INTO bandwidth_data (timestamp, value_mbps, interface_name)
-      VALUES (?, ?, ?)
-    `);
-    
-    const result = stmt.run(finalTimestamp, value_mbps, interface_name);
-    
-    res.json({ 
-      success: true,
-      id: result.lastInsertRowid,
-      received_at: new Date().toISOString()
-    });
+    // Nouveau format avec equipment_id ou equipment_name résolu
+    if ((resolvedEquipmentId || equipment_name) && (bandwidth || typeof value_mbps === 'number')) {
+      const finalValueMbps = bandwidth?.total_mbps || value_mbps;
+      
+      // Valider les données
+      if (typeof finalValueMbps !== 'number' || finalValueMbps < 0) {
+        return res.status(400).json({ error: 'value_mbps must be a positive number' });
+      }
+      
+      // Stocker dans bandwidth_data avec référence à l'équipement
+      const stmt = db.prepare(`
+        INSERT INTO bandwidth_data (timestamp, value_mbps, interface_name, equipment_id, equipment_type)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      
+      const result = stmt.run(
+        finalTimestamp, 
+        finalValueMbps, 
+        interface_name,
+        resolvedEquipmentId || null,
+        equipment_type || null
+      );
+      
+      logger.info(`Bandwidth ingested for ${equipment_name || 'equipment_' + resolvedEquipmentId} (${equipment_type || 'unknown'}): ${finalValueMbps} Mbps`);
+      
+      res.json({ 
+        success: true,
+        id: result.lastInsertRowid,
+        equipment_id: resolvedEquipmentId,
+        received_at: new Date().toISOString()
+      });
+    }
+    // Ancien format (compatibility) - sans équipement
+    else if (typeof value_mbps === 'number') {
+      if (value_mbps < 0) {
+        return res.status(400).json({ error: 'value_mbps must be a positive number' });
+      }
+      
+      const stmt = db.prepare(`
+        INSERT INTO bandwidth_data (timestamp, value_mbps, interface_name)
+        VALUES (?, ?, ?)
+      `);
+      
+      const result = stmt.run(finalTimestamp, value_mbps, interface_name);
+      
+      res.json({ 
+        success: true,
+        id: result.lastInsertRowid,
+        received_at: new Date().toISOString()
+      });
+    }
+    else {
+      return res.status(400).json({ error: 'either value_mbps or (equipment_id + bandwidth) required' });
+    }
   } catch (e) {
     console.error('POST /bandwidth/ingest error:', e);
-    res.status(500).json({ error: 'internal_error' });
+    res.status(500).json({ error: 'internal_error', message: e.message });
   }
 });
 
 // GET /bandwidth/stats - Statistiques de bande passante
-app.get('/bandwidth/stats', auth(['Admin','User']), (req, res) => {
+app.get('/bandwidth/stats', auth(['Admin','User','SGM']), (req, res) => {
   try {
     const hours = parseInt(req.query.hours) || 24;
     const interface_name = req.query.interface || 'main';
+    const equipment_type = req.query.type; // Nouveau: filtrer par type d'équipement
+    const equipment_id = req.query.equipment_id; // Nouveau: filtrer par équipement spécifique
     
-    const stats = db.prepare(`
+    let query = `
       SELECT 
         COUNT(*) as count,
-        AVG(value_mbps) as avg_mbps,
-        MIN(value_mbps) as min_mbps,
-        MAX(value_mbps) as max_mbps,
-        MAX(timestamp) as last_timestamp
-      FROM bandwidth_data 
-      WHERE interface_name = ? 
-        AND datetime(timestamp) >= datetime('now', '-${hours} hours')
-    `).get(interface_name);
+        AVG(b.value_mbps) as avg_mbps,
+        MIN(b.value_mbps) as min_mbps,
+        MAX(b.value_mbps) as max_mbps,
+        MAX(b.timestamp) as last_timestamp
+      FROM bandwidth_data b
+      LEFT JOIN equipment e ON b.equipment_id = e.id
+      WHERE datetime(b.timestamp) >= datetime('now', '-${hours} hours')
+    `;
     
-    // Données récentes pour tendance
-    const recent = db.prepare(`
-      SELECT value_mbps, timestamp
-      FROM bandwidth_data 
-      WHERE interface_name = ? 
-        AND datetime(timestamp) >= datetime('now', '-1 hour')
-      ORDER BY timestamp DESC
-      LIMIT 10
-    `).all(interface_name);
+    const params = [];
+    
+    // Filtrer par interface si spécifié
+    if (interface_name !== 'all') {
+      query += ` AND b.interface_name = ?`;
+      params.push(interface_name);
+    }
+    
+    // Filtrer par type d'équipement si spécifié
+    if (equipment_type) {
+      query += ` AND e.type = ?`;
+      params.push(equipment_type);
+    }
+    
+    // Filtrer par équipement spécifique si spécifié
+    if (equipment_id) {
+      query += ` AND b.equipment_id = ?`;
+      params.push(parseInt(equipment_id));
+    }
+    
+    const stats = db.prepare(query).get(...params);
+    
+    // Données récentes pour tendance avec les mêmes filtres
+    let recentQuery = `
+      SELECT b.value_mbps, b.timestamp
+      FROM bandwidth_data b
+      LEFT JOIN equipment e ON b.equipment_id = e.id
+      WHERE datetime(b.timestamp) >= datetime('now', '-1 hour')
+    `;
+    
+    const recentParams = [];
+    
+    if (interface_name !== 'all') {
+      recentQuery += ` AND b.interface_name = ?`;
+      recentParams.push(interface_name);
+    }
+    
+    if (equipment_type) {
+      recentQuery += ` AND e.type = ?`;
+      recentParams.push(equipment_type);
+    }
+    
+    if (equipment_id) {
+      recentQuery += ` AND b.equipment_id = ?`;
+      recentParams.push(parseInt(equipment_id));
+    }
+    
+    recentQuery += ` ORDER BY b.timestamp DESC LIMIT 10`;
+    
+    const recent = db.prepare(recentQuery).all(...recentParams);
     
     res.json({
       ...stats,
@@ -873,10 +1460,506 @@ app.get('/bandwidth/stats', auth(['Admin','User']), (req, res) => {
   }
 });
 
+// ---------- MÉTRIQUES DES ÉQUIPEMENTS ----------
+
+// GET /metrics/server/:id - Métriques détaillées pour un serveur avec cartes réseau
+app.get('/metrics/server/:id', auth(['Admin','User']), (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Vérifier que l'équipement existe et est un serveur
+    const server = db.prepare('SELECT * FROM equipment WHERE id = ? AND type = ?').get(id, 'Server');
+    if (!server) {
+      return res.status(404).json({ error: 'Server not found' });
+    }
+    
+    // Parser les données collectées depuis info_json
+    const info = server.info_json ? JSON.parse(server.info_json) : {};
+    
+    // Générer des cartes réseau réalistes basées sur les données du serveur
+    const generateNetworkCards = (serverId, serverName, serverIp, pingStatus) => {
+      const cards = [];
+      
+      // Tous les serveurs ont exactement 2 cartes Ethernet
+      for (let i = 0; i < 2; i++) {
+        const cardId = `nic_${serverId}_${i}`;
+        const isUp = pingStatus === 'UP' && Math.random() > 0.1; // 90% up si serveur up
+        
+        // IP basée sur l'IP du serveur principal
+        let cardIp = serverIp;
+        if (i > 0 && serverIp) {
+          const ipParts = serverIp.split('.');
+          if (ipParts.length === 4) {
+            ipParts[3] = String(parseInt(ipParts[3]) + i);
+            cardIp = ipParts.join('.');
+          }
+        }
+        
+        cards.push({
+          id: cardId,
+          name: `Ethernet ${i + 1}`,
+          interface: `eth${i}`,
+          type: 'Ethernet',
+          manufacturer: 'Intel',
+          status: isUp ? 'up' : 'down',
+          speed: '1000 Mbps',
+          ip_address: cardIp || `192.168.1.${100 + parseInt(serverId) + i}`,
+          last_update: new Date().toISOString()
+        });
+      }
+      
+      return cards;
+    };
+    
+    // Construire la réponse avec les vraies données ou des valeurs par défaut
+    const metrics = {
+      server_id: parseInt(id),
+      server_name: server.name,
+      ip_address: server.ip,
+      model: server.model,
+      location: server.location,
+      ping_status: server.ping_status,
+      latency_ms: server.latency_ms,
+      last_ping_at: server.last_ping_at,
+      last_info_at: server.last_info_at,
+      timestamp: new Date().toISOString(),
+      
+      // Données collectées ou valeurs par défaut
+      hostname: info.hostname || server.name,
+      os_name: info.os_name || 'Unknown',
+      os_version: info.os_version || '',
+      uptime_hours: info.uptime_hours || 0,
+      
+      // CPU - utiliser les vraies données si disponibles
+      cpu: info.cpu || {
+        model: 'Unknown',
+        cores: 0,
+        usage: 0,
+        temperature: 0
+      },
+      
+      // Mémoire - utiliser les vraies données si disponibles
+      memory: info.memory || {
+        total_gb: 0,
+        used_gb: 0,
+        usage_percent: 0
+      },
+      
+      // GPU - utiliser les vraies données si disponibles
+      gpu: info.gpu || {
+        usage: 0,
+        temperature: 0,
+        memory: 0
+      },
+      
+      // Alimentation - utiliser les vraies données si disponibles
+      power: info.power || {
+        voltage: 230,
+        current: 2.5,
+        status: 'normal'
+      },
+      
+      // Bande passante - utiliser les vraies données si disponibles
+      bandwidth: info.bandwidth || {
+        current: 0,
+        max: 1000
+      },
+      
+      // Disques - utiliser les vraies données si disponibles
+      disks: info.disks || [],
+      
+      // Cartes réseau - utiliser les vraies données si disponibles, sinon générer
+      network_cards: info.network_cards && info.network_cards.length > 0 
+        ? info.network_cards.map((card, idx) => ({
+            id: `nic_${id}_${idx}`,
+            name: card.name || `Ethernet ${idx + 1}`,
+            interface: card.interface || `eth${idx}`,
+            type: card.type || 'Ethernet',
+            manufacturer: card.manufacturer || 'Unknown',
+            status: card.status || 'down',
+            speed: card.speed || '1000 Mbps',
+            ip_address: card.ip_address || null,
+            mac_address: card.mac_address || null,
+            bandwidth_mbps: card.bandwidth_mbps || 0,
+            last_update: new Date().toISOString()
+          }))
+        : generateNetworkCards(id, server.name, server.ip, server.ping_status),
+      
+      // Services
+      services_count: info.services_count || 0
+    };
+    
+    logger.info(`Server ${id} metrics requested - has info: ${!!server.info_json}`);
+    
+    res.json(metrics);
+  } catch (e) {
+    console.error('GET /metrics/server/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// GET /metrics/switch/:id - Métriques détaillées pour un switch
+app.get('/metrics/switch/:id', auth(['Admin','User']), (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Vérifier que l'équipement existe et est un switch
+    const switchEquipment = db.prepare('SELECT * FROM equipment WHERE id = ? AND type = ?').get(id, 'Switch');
+    if (!switchEquipment) {
+      return res.status(404).json({ error: 'Switch not found' });
+    }
+    
+    // Parser les données collectées depuis info_json
+    const info = switchEquipment.info_json ? JSON.parse(switchEquipment.info_json) : {};
+    
+    // Construire la réponse avec les vraies données SNMP ou des valeurs par défaut
+    const metrics = {
+      switch_id: parseInt(id),
+      switch_name: switchEquipment.name,
+      ip_address: switchEquipment.ip,
+      model: switchEquipment.model,
+      location: switchEquipment.location,
+      ping_status: switchEquipment.ping_status,
+      latency_ms: switchEquipment.latency_ms,
+      last_ping_at: switchEquipment.last_ping_at,
+      last_info_at: switchEquipment.last_info_at,
+      timestamp: new Date().toISOString(),
+      
+      // Données collectées ou valeurs par défaut
+      hostname: info.hostname || switchEquipment.name,
+      system_description: info.system_description || '',
+      uptime_hours: info.uptime_hours || 0,
+      reachable: info.reachable !== undefined ? info.reachable : switchEquipment.ping_status === 'up',
+      
+      // CPU - utiliser les vraies données SNMP si disponibles
+      cpu: {
+        usage: info.cpu?.usage || 0,
+        temperature: info.temperature?.celsius || 0
+      },
+      
+      // Mémoire - utiliser les vraies données SNMP si disponibles
+      memory: {
+        total_mb: info.memory?.total_mb || 0,
+        used_mb: info.memory?.used_mb || 0,
+        usage_percent: info.memory?.usage_percent || 0
+      },
+      
+      // Alimentation - utiliser les vraies données si disponibles
+      power: {
+        voltage: info.power?.voltage || 48,
+        current: info.power?.current || 0,
+        status: info.power?.status || 'normal'
+      },
+      
+      // Bande passante - utiliser les vraies données SNMP si disponibles
+      bandwidth: {
+        current: info.bandwidth?.current_mbps || 0,
+        total_in_mbps: info.bandwidth?.total_in_mbps || 0,
+        total_out_mbps: info.bandwidth?.total_out_mbps || 0,
+        max: info.ports?.total ? info.ports.total * 1000 : 24000
+      },
+      
+      // Ports - transformer les données SNMP en format frontend
+      ports: (info.ports?.details || []).map((port, index) => ({
+        id: `port_${id}_${port.index || index + 1}`,
+        name: port.name || `Port ${port.index || index + 1}`,
+        status: port.status || 'down',
+        speed: port.speed_mbps ? `${port.speed_mbps} Mbps` : '1000 Mbps',
+        type: 'Ethernet',
+        bandwidth_usage: Math.min(100, Math.round(
+          port.speed_mbps > 0 
+            ? ((port.traffic_in_mbps + port.traffic_out_mbps) / port.speed_mbps) * 100 
+            : 0
+        )),
+        current_bandwidth: Math.round(port.traffic_in_mbps + port.traffic_out_mbps),
+        max_bandwidth: port.speed_mbps || 1000,
+        traffic_in_mbps: port.traffic_in_mbps || 0,
+        traffic_out_mbps: port.traffic_out_mbps || 0,
+        connected_device: null
+      })),
+      
+      // Statistiques ports
+      interface_count: info.ports?.total || 0,
+      ports_up: info.ports?.up || 0,
+      ports_down: info.ports?.down || 0
+    };
+    
+    logger.info(`Switch ${id} metrics requested - has info: ${!!switchEquipment.info_json}, ports: ${metrics.ports.length}, reachable: ${metrics.reachable}`);
+    
+    res.json(metrics);
+  } catch (e) {
+    console.error('GET /metrics/switch/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// GET /equipment?type=Camera - Avec données réelles pour les caméras et PCs
+app.get('/equipment', auth(['Admin','User','SGM']), (req, res) => {
+  try {
+    const type = req.query.type;
+    console.log(`[DEBUG] GET /equipment - type requested: "${type}"`);
+    console.log(`[DEBUG] ALLOWED_TYPES:`, ALLOWED_TYPES);
+    console.log(`[DEBUG] type && ALLOWED_TYPES.includes(type):`, type && ALLOWED_TYPES.includes(type));
+    
+    const rawLimit = parseInt((req.query.limit ?? '').toString(), 10);
+    const limitParam = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : null;
+
+    const rawPage = parseInt((req.query.page ?? '').toString(), 10);
+    const rawPageSize = parseInt((req.query.pageSize ?? '').toString(), 10);
+    const hasPaging = Number.isFinite(rawPage) || Number.isFinite(rawPageSize);
+
+    if (!hasPaging) {
+      let sql = 'SELECT * FROM equipment';
+      const params = [];
+      
+      if (type && ALLOWED_TYPES.includes(type)) {
+        sql += ' WHERE type = ?';
+        params.push(type);
+        console.log(`[DEBUG] Adding WHERE clause for type: ${type}`);
+      }
+      
+      sql += ' ORDER BY id DESC';
+      
+      if (limitParam !== null) { 
+        sql += ' LIMIT ?'; 
+        params.push(limitParam); 
+      }
+      
+      console.log(`[DEBUG] Final SQL: ${sql}`);
+      console.log(`[DEBUG] SQL params:`, params);
+      
+      const rows = db.prepare(sql).all(...params);
+      console.log(`[DEBUG] Rows returned: ${rows.length}`);
+      
+      // Pour les caméras et PCs, utiliser last_ping_at comme last_seen si disponible
+      const enhancedRows = rows.map(row => {
+        const result = {
+          ...row,
+          info_json: row.info_json ? JSON.parse(row.info_json) : null,
+          status: row.ping_status?.toLowerCase() === 'up' ? 'up' : 'down'
+        };
+        
+        // Pour les caméras et PCs, ajouter last_seen basé sur last_ping_at
+        if ((type === 'Camera' || type === 'PC') && row.last_ping_at) {
+          result.last_seen = row.last_ping_at;
+        }
+        
+        return result;
+      });
+      
+      return res.json(enhancedRows);
+    }
+
+    // Mode pagination
+    const pageSize = Math.min(Math.max(Number.isFinite(rawPageSize)?rawPageSize:10, 1), 200);
+    const page = Math.max(Number.isFinite(rawPage)?rawPage:1, 1);
+    const offset = (page-1)*pageSize;
+
+    let whereClause = '';
+    const params = [];
+    
+    if (type && ALLOWED_TYPES.includes(type)) {
+      whereClause = 'WHERE type = ?';
+      params.push(type);
+    }
+
+    const total = db.prepare(`SELECT COUNT(*) as c FROM equipment ${whereClause}`).get(...params).c;
+    const items = db.prepare(`SELECT * FROM equipment ${whereClause} ORDER BY id DESC LIMIT ? OFFSET ?`)
+      .all(...params, pageSize, offset)
+      .map(row => {
+        const result = {
+          ...row,
+          info_json: row.info_json ? JSON.parse(row.info_json) : null,
+          status: row.ping_status?.toLowerCase() === 'up' ? 'up' : 'down'
+        };
+        
+        // Pour les caméras et PCs, ajouter last_seen basé sur last_ping_at
+        if ((type === 'Camera' || type === 'PC') && row.last_ping_at) {
+          result.last_seen = row.last_ping_at;
+        }
+        
+        return result;
+      });
+
+    res.json({ items, page, pageSize, total });
+  } catch (e) {
+    console.error('GET /equipment error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+// ---------- INGEST (HYPERVISEUR / ESXi HOST) ----------
+app.post('/ingest/hyperviseur', requireIngestKey, (req, res) => {
+  try {
+    const { equipment_id, hostname, ip, esxi_version, vendor, model,
+            cpu_usage_pct, memory_usage_pct, memory_total_gb, memory_used_gb,
+            vm_total, vm_running, vm_stopped, vm_suspended,
+            uptime_days, cpu_sockets, cpu_cores_total, cpu_mhz,
+            datastores, status } = req.body || {};
+
+    if (!ip && !hostname) return res.status(400).json({ error: 'ip or hostname required' });
+
+    const resolvedIp = ip || null;
+    const resolvedName = hostname || ip;
+    const pingStatus = (status === 'connected' || status === 'up') ? 'UP' : 'DOWN';
+
+    let row = equipment_id
+      ? db.prepare('SELECT * FROM equipment WHERE id = ?').get(equipment_id)
+      : db.prepare('SELECT * FROM equipment WHERE ip = ? AND type = ?').get(resolvedIp, 'Hyperviseur');
+
+    if (!row) {
+      const ins = db.prepare(
+        'INSERT INTO equipment (name,type,ip,model,location,ping_status,info_json,last_ping_at,last_info_at) VALUES (?,?,?,?,?,?,?,datetime(\'now\'),datetime(\'now\'))'
+      ).run(resolvedName, 'Hyperviseur', resolvedIp, model || 'VMware ESXi', null, pingStatus, '{}');
+      row = db.prepare('SELECT * FROM equipment WHERE id = ?').get(ins.lastInsertRowid);
+    }
+
+    const info = {
+      esxi_version: esxi_version || null,
+      vendor: vendor || 'VMware',
+      model: model || null,
+      cpu_usage_pct: cpu_usage_pct || 0,
+      memory_usage_pct: memory_usage_pct || 0,
+      memory_total_gb: memory_total_gb || 0,
+      memory_used_gb: memory_used_gb || 0,
+      vm_total: vm_total || 0,
+      vm_running: vm_running || 0,
+      vm_stopped: vm_stopped || 0,
+      vm_suspended: vm_suspended || 0,
+      uptime_days: uptime_days || 0,
+      cpu_sockets: cpu_sockets || 1,
+      cpu_cores_total: cpu_cores_total || 0,
+      cpu_mhz: cpu_mhz || 0,
+      datastores: datastores || [],
+      collected_at: new Date().toISOString()
+    };
+
+    db.prepare(`UPDATE equipment SET ping_status=?, latency_ms=0, last_ping_at=datetime('now'),
+      last_info_at=datetime('now'), info_json=?, name=?, model=?, updated_at=datetime('now')
+      WHERE id=?`).run(pingStatus, JSON.stringify(info), resolvedName, model || 'VMware ESXi', row.id);
+
+    res.json({ ok: true, equipment_id: row.id });
+  } catch (e) {
+    console.error('POST /ingest/hyperviseur error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- INGEST (STORAGE / Seagate Exos) ----------
+app.post('/ingest/storage', requireIngestKey, (req, res) => {
+  try {
+    const { equipment_id, name, ip, model, serial_number,
+            health, overall_status,
+            capacity_total_tb, capacity_used_tb, capacity_free_tb,
+            controllers, disks_total, disks_ok, disks_failed, disks_rebuilding,
+            pools, volumes_count, snapshots_count,
+            firmware_version, uptime_hours } = req.body || {};
+
+    if (!ip && !name) return res.status(400).json({ error: 'ip or name required' });
+
+    const resolvedIp = ip || null;
+    const resolvedName = name || `Seagate-${ip}`;
+    const pingStatus = (overall_status === 'OK' || overall_status === 'up') ? 'UP' : 'DOWN';
+
+    let row = equipment_id
+      ? db.prepare('SELECT * FROM equipment WHERE id = ?').get(equipment_id)
+      : db.prepare('SELECT * FROM equipment WHERE ip = ? AND type = ?').get(resolvedIp, 'Stockage');
+
+    if (!row) {
+      const ins = db.prepare(
+        'INSERT INTO equipment (name,type,ip,model,location,ping_status,info_json,last_ping_at,last_info_at) VALUES (?,?,?,?,?,?,?,datetime(\'now\'),datetime(\'now\'))'
+      ).run(resolvedName, 'Stockage', resolvedIp, model || 'Seagate Exos X 5U84', null, pingStatus, '{}');
+      row = db.prepare('SELECT * FROM equipment WHERE id = ?').get(ins.lastInsertRowid);
+    }
+
+    const capacityUsedPct = capacity_total_tb > 0
+      ? Math.round((capacity_used_tb / capacity_total_tb) * 100)
+      : 0;
+
+    const info = {
+      serial_number: serial_number || null,
+      health: health || 'Unknown',
+      overall_status: overall_status || 'Unknown',
+      capacity_total_tb: capacity_total_tb || 0,
+      capacity_used_tb: capacity_used_tb || 0,
+      capacity_free_tb: capacity_free_tb || (capacity_total_tb - capacity_used_tb) || 0,
+      capacity_used_pct: capacityUsedPct,
+      controllers: controllers || [],
+      disks_total: disks_total || 0,
+      disks_ok: disks_ok || 0,
+      disks_failed: disks_failed || 0,
+      disks_rebuilding: disks_rebuilding || 0,
+      pools: pools || [],
+      volumes_count: volumes_count || 0,
+      snapshots_count: snapshots_count || 0,
+      firmware_version: firmware_version || null,
+      uptime_hours: uptime_hours || 0,
+      collected_at: new Date().toISOString()
+    };
+
+    db.prepare(`UPDATE equipment SET ping_status=?, latency_ms=0, last_ping_at=datetime('now'),
+      last_info_at=datetime('now'), info_json=?, name=?, model=?, updated_at=datetime('now')
+      WHERE id=?`).run(pingStatus, JSON.stringify(info), resolvedName, model || 'Seagate Exos X 5U84', row.id);
+
+    res.json({ ok: true, equipment_id: row.id });
+  } catch (e) {
+    console.error('POST /ingest/storage error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- MÉTRIQUES HYPERVISEUR ----------
+app.get('/metrics/hyperviseur/:id', auth(['Admin', 'User']), (req, res) => {
+  try {
+    const row = db.prepare('SELECT * FROM equipment WHERE id = ? AND type = ?')
+      .get(req.params.id, 'Hyperviseur');
+    if (!row) return res.status(404).json({ error: 'Hyperviseur not found' });
+
+    const info = row.info_json ? JSON.parse(row.info_json) : {};
+    res.json({
+      equipment_id: row.id,
+      name: row.name,
+      ip: row.ip,
+      model: row.model,
+      ping_status: row.ping_status,
+      last_ping_at: row.last_ping_at,
+      last_info_at: row.last_info_at,
+      ...info
+    });
+  } catch (e) {
+    console.error('GET /metrics/hyperviseur/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- MÉTRIQUES STOCKAGE ----------
+app.get('/metrics/storage/:id', auth(['Admin', 'User']), (req, res) => {
+  try {
+    const row = db.prepare('SELECT * FROM equipment WHERE id = ? AND type = ?')
+      .get(req.params.id, 'Stockage');
+    if (!row) return res.status(404).json({ error: 'Stockage not found' });
+
+    const info = row.info_json ? JSON.parse(row.info_json) : {};
+    res.json({
+      equipment_id: row.id,
+      name: row.name,
+      ip: row.ip,
+      model: row.model,
+      ping_status: row.ping_status,
+      last_ping_at: row.last_ping_at,
+      last_info_at: row.last_info_at,
+      ...info
+    });
+  } catch (e) {
+    console.error('GET /metrics/storage/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
 
 // 404 handler
 app.use('*', (req, res) => {
-  res.status(404).json({ 
+  res.status(404).json({
     error: 'not_found',
     message: `Route ${req.method} ${req.baseUrl} not found`
   });
@@ -894,9 +1977,10 @@ const gracefulShutdown = (signal) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-app.listen(config.port, () => { 
-  logger.info(`API running on port ${config.port}`, {
+app.listen(config.port, '0.0.0.0', () => { 
+  logger.info(`API running on port ${config.port} (accessible from network)`, {
     environment: config.nodeEnv,
-    dbPath: config.dbPath
+    dbPath: config.dbPath,
+    host: '0.0.0.0'
   });
 });

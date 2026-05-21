@@ -1,16 +1,6 @@
-# Frontend Dockerfile
-FROM node:20-alpine AS build
-WORKDIR /app
-COPY package.json package-lock.json* ./
-# Install with devDependencies (needed for Tailwind/Vite build)
-RUN npm install
-COPY . .
-# Build static assets
-RUN npm run build
-
-# Serve build with Vite preview (simple & zero-config)
-FROM node:20-alpine AS runner
-WORKDIR /app
-COPY --from=build /app /app
+# Frontend Dockerfile — dist pré-compilé localement, servi par nginx
+FROM nginx:alpine
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY dist /usr/share/nginx/html
 EXPOSE 5173
-CMD ["npm","run","preview","--","--port","5173","--host"]
+CMD ["nginx", "-g", "daemon off;"]

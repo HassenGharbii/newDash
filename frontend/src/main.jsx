@@ -8,6 +8,13 @@ import Home from './views/Home'
 import Equipment from './views/Equipment'
 import Stats from './views/Stats'
 import SafeKit from './views/SafeKit'
+import VMware from './views/VMware'
+import Storage from './views/Storage'
+import Bandwidth from './views/Bandwidth'
+import Cameras from './views/Cameras'
+import Switches from './views/Switches'
+import PCs from './views/PCs'
+import Servers from './views/Servers'
 import AdminPanel from './views/AdminPanel'
 import Login from './views/Login'
 // ❌ on supprime l'import de ./App.jsx qui entrait en conflit
@@ -22,31 +29,33 @@ function RequireAuth({ children, role }) {
   return children
 }
 
-// Redirection automatique vers l'accueil toutes les 10 min
+// Redirection automatique vers l'accueil toutes les 10 min - DÉSACTIVÉ
 function AutoRedirectWrapper({ children }) {
-  const navigate = useNavigate()
-  const isAuthed = useAuthStore(s => s.isAuthenticated())
-  const location = useLocation()
-  React.useEffect(() => {
-    const t = setInterval(() => {
-      // évite de casser l'écran de login et ne fait rien si pas authentifié
-      if (isAuthed && location.pathname !== '/') navigate('/')
-    }, 10 * 60 * 1000)
-    return () => clearInterval(t)
-  }, [navigate, isAuthed, location.pathname])
+  // DÉSACTIVÉ - Causait des problèmes de navigation
+  // const navigate = useNavigate()
+  // const isAuthed = useAuthStore(s => s.isAuthenticated())
+  // const location = useLocation()
+  // React.useEffect(() => {
+  //   const t = setInterval(() => {
+  //     // évite de casser l'écran de login et ne fait rien si pas authentifié
+  //     if (isAuthed && location.pathname !== '/') navigate('/')
+  //   }, 10 * 60 * 1000)
+  //   return () => clearInterval(t)
+  // }, [navigate, isAuthed, location.pathname])
   return children
 }
 
-// Au boot, forcer l’arrivée sur /login si non authentifié
+// Au boot, forcer l'arrivée sur /login si non authentifié - DÉSACTIVÉ
 function BootToLogin({ children }) {
-  const isAuthed = useAuthStore(s => s.isAuthenticated())
-  const location = useLocation()
-  const navigate = useNavigate()
-  React.useEffect(() => {
-    if (!isAuthed && location.pathname !== '/login') {
-      navigate('/login', { replace: true })
-    }
-  }, [isAuthed, location.pathname, navigate])
+  // DÉSACTIVÉ - Causait des problèmes de navigation
+  // const isAuthed = useAuthStore(s => s.isAuthenticated())
+  // const location = useLocation()
+  // const navigate = useNavigate()
+  // React.useEffect(() => {
+  //   if (!isAuthed && location.pathname !== '/login') {
+  //     navigate('/login', { replace: true })
+  //   }
+  // }, [isAuthed, location.pathname, navigate])
   return children
 }
 
@@ -56,22 +65,29 @@ function App() {
       <AutoRedirectWrapper>
         <BootToLogin>
           <Routes>
-            {/* Zone protégée : nécessite d'être connecté */}
-            <Route path="/" element={<RequireAuth><Layout/></RequireAuth>}>
-              <Route index element={<Home/>} />
-              {/* 🔁 routes alignées avec le menu */}
-              <Route path="equipements" element={<Equipment/>} />
-              <Route path="stats" element={<Stats/>} />
-              <Route path="safekitlanalert" element={<SafeKit/>} />
-              <Route path="paneladmin" element={<RequireAuth role="Admin"><AdminPanel/></RequireAuth>} />
-            </Route>
+          {/* Zone protégée : nécessite d'être connecté */}
+          <Route path="/" element={<RequireAuth><Layout/></RequireAuth>}>
+            <Route index element={<Home/>} />
+            {/* Routes alignées avec le menu */}
+            <Route path="cameras" element={<Cameras/>} />
+            <Route path="switches" element={<Switches/>} />
+            <Route path="pcs" element={<PCs/>} />
+            <Route path="servers" element={<Servers/>} />
+            <Route path="equipements" element={<Equipment/>} />
+            <Route path="stats" element={<Stats/>} />
+            <Route path="safekit" element={<SafeKit/>} />
+            <Route path="vmware" element={<VMware/>} />
+            <Route path="stockage" element={<Storage/>} />
+            <Route path="bande-passante" element={<Bandwidth/>} />
+            <Route path="paneladmin" element={<RequireAuth role="Admin"><AdminPanel/></RequireAuth>} />
+          </Route>
 
-            {/* Login accessible sans auth */}
-            <Route path="/login" element={<Login/>} />
+          {/* Login accessible sans auth */}
+          <Route path="/login" element={<Login/>} />
 
-            {/* Toute autre route -> racine (qui renverra vers /login si non auth) */}
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          {/* Toute autre route -> racine (qui renverra vers /login si non auth) */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
         </BootToLogin>
       </AutoRedirectWrapper>
     </BrowserRouter>

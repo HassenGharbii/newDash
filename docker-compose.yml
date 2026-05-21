@@ -10,11 +10,39 @@ services:
       - INGEST_KEY=change-me-strong
     volumes:
       - ./backend/data:/app/data
+    restart: always
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_URL=http://localhost:4000
     environment:
-      - VITE_API_URL=http://api:4000
+      - VITE_API_URL=http://localhost:4000
     ports:
-      - "5173:5173"
+      - "3001:5173"
     depends_on:
       - api
+  ping-monitor:
+    build:
+      context: .
+      dockerfile: docker/monitor/Dockerfile
+    image: semmaris/monitors:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/PingEquipment.ps1
+    environment:
+      - API_URL=http://api:4000
+      - INGEST_KEY=change-me-strong
+    depends_on:
+      - api
+    restart: always
+
+  bandwidth-monitor:
+    build:
+      context: .
+      dockerfile: docker/monitor/Dockerfile
+    image: semmaris/monitors:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/BandwidthMonitor.ps1 -ApiUrl http://api:4000 -ApiKey change-me-strong
+    depends_on:
+      - api
+    restart: always

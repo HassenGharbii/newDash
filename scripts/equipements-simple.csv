@@ -1,0 +1,5 @@
+name,type,ip,model,location
+SRV-DB1,Server,10.0.0.11,Dell R740,Salle A
+SW-CORE1,Switch,10.0.0.21,Cisco C9300,Baie 12
+CAM-ENT-01,Camera,10.0.1.10,IP Camera,Entree A
+POSTE-OPER-01,PC,10.0.2.15,HP ProDesk,Bureau Ops

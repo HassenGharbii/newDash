@@ -183,6 +183,7 @@ function EquipmentsAdmin(){
   const [page,setPage]     = React.useState(1)
   const pageSize           = 10
   const [total,setTotal]   = React.useState(0)
+  const [selected, setSelected] = React.useState([])
 
   const [drawerOpen,setDrawerOpen] = React.useState(false)
   const emptyForm = { name:'', ip:'', type:'Server', model:'', location:'' }
@@ -229,12 +230,22 @@ function EquipmentsAdmin(){
         setMsg(editId?'Équipement mis à jour ✅':'Équipement créé ✅')
         closeDrawer()
         search()
-        notifyChange()
+        // Délai pour laisser le backend traiter les nouvelles données
+        setTimeout(() => notifyChange(), 500)
       } else {
-        setMsg((data && data.error) || 'Erreur')
+        // Messages d'erreur personnalisés
+        if (data?.error === 'duplicate_model') {
+          setMsg('❌ Ce modèle existe déjà')
+        } else if (data?.error === 'duplicate_ip') {
+          setMsg('❌ Cette IP existe déjà')
+        } else if (data?.message) {
+          setMsg('❌ ' + data.message)
+        } else {
+          setMsg('❌ ' + (data?.error || 'Erreur'))
+        }
       }
     }catch{
-      setMsg('Erreur')
+      setMsg('❌ Erreur de connexion')
     }
   }
 
@@ -242,8 +253,91 @@ function EquipmentsAdmin(){
     if(!confirm('Supprimer cet équipement ?')) return
     try{
       const r=await fetch(`${API}/equipment/${id}`,{method:'DELETE',headers:authHeader()})
-      if(r.ok){ search(); notifyChange() } else { setMsg('Suppression impossible') }
+      if(r.ok){ 
+        search(); 
+        // Délai pour laisser le backend traiter les changements
+        setTimeout(() => notifyChange(), 500)
+      } else { 
+        setMsg('Suppression impossible') 
+      }
     }catch{ setMsg('Suppression impossible') }
+  }
+
+  const onBulkDelete = async ()=>{
+    if(selected.length === 0) { setMsg('Aucun équipement sélectionné'); return }
+    if(!confirm(`Supprimer ${selected.length} équipement(s) sélectionné(s) ?`)) return
+    try{
+      const r=await fetch(`${API}/equipment/bulk-delete`,{method:'POST',headers:jsonHeader(),body:JSON.stringify({ids:selected})})
+      if(r.ok){ 
+        const data = await r.json().catch(()=>null)
+        setMsg(`${data?.deleted || 0} équipement(s) supprimé(s) ✅`)
+        setSelected([])
+        search(); 
+        setTimeout(() => notifyChange(), 500)
+      } else { 
+        const errorData = await r.json().catch(()=>null)
+        console.error('Bulk delete error:', r.status, errorData)
+        setMsg(`❌ Suppression impossible (${errorData?.error || r.status})`) 
+      }
+    }catch(err){ 
+      console.error('Bulk delete exception:', err)
+      setMsg('❌ Erreur de connexion') 
+    }
+  }
+
+  const toggleSelect = (id) => {
+    setSelected(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id])
+  }
+
+  const toggleSelectAll = () => {
+    if(selected.length === items.length) setSelected([])
+    else setSelected(items.map(it => it.id))
+  }
+
+  const deleteByType = async () => {
+    const type = prompt('Supprimer tous les équipements de type :\n\nCamera\nSwitch\nServer\nPC\n\nEntrez le type:')
+    if (!type) return
+    const validTypes = ['Camera', 'Switch', 'Server', 'PC']
+    if (!validTypes.includes(type)) {
+      setMsg('Type invalide. Utilisez: Camera, Switch, Server ou PC')
+      return
+    }
+    if (!confirm(`⚠️ ATTENTION: Supprimer TOUS les équipements de type "${type}" ?`)) return
+    
+    try {
+      const r = await fetch(`${API}/equipment/delete-by-type/${type}`, {method:'DELETE', headers:authHeader()})
+      if (r.ok) {
+        const data = await r.json().catch(()=>null)
+        setMsg(`${data?.deleted || 0} équipement(s) de type "${type}" supprimé(s) ✅`)
+        search()
+        setTimeout(() => notifyChange(), 500)
+      } else {
+        setMsg('❌ Suppression impossible')
+      }
+    } catch(err) {
+      console.error('Delete by type error:', err)
+      setMsg('❌ Erreur de connexion')
+    }
+  }
+
+  const deleteAll = async () => {
+    if (!confirm('⚠️ DANGER: Supprimer TOUS les équipements de la base ?')) return
+    if (!confirm('⚠️ Êtes-vous VRAIMENT sûr ? Cette action est irréversible !')) return
+    
+    try {
+      const r = await fetch(`${API}/equipment/delete-all`, {method:'DELETE', headers:authHeader()})
+      if (r.ok) {
+        const data = await r.json().catch(()=>null)
+        setMsg(`${data?.deleted || 0} équipement(s) supprimé(s) ✅`)
+        search()
+        setTimeout(() => notifyChange(), 500)
+      } else {
+        setMsg('❌ Suppression impossible')
+      }
+    } catch(err) {
+      console.error('Delete all error:', err)
+      setMsg('❌ Erreur de connexion')
+    }
   }
 
   const downloadTemplate = async ()=>{
@@ -256,6 +350,20 @@ function EquipmentsAdmin(){
       const a = document.createElement('a'); a.href = url; a.download = 'equipements-template.xlsx'
       document.body.appendChild(a); a.click(); a.remove(); window.URL.revokeObjectURL(url)
     }catch{ setMsg('Erreur lors du téléchargement') }
+  }
+
+  const exportAllToExcel = async ()=>{
+    setMsg('Export en cours...')
+    try{
+      const res = await fetch(`${API}/equipment/export-excel`, { headers: authHeader() })
+      if(!res.ok) throw new Error()
+      const blob = await res.blob()
+      const url  = window.URL.createObjectURL(blob)
+      const timestamp = new Date().toISOString().split('T')[0]
+      const a = document.createElement('a'); a.href = url; a.download = `equipements-export-${timestamp}.xlsx`
+      document.body.appendChild(a); a.click(); a.remove(); window.URL.revokeObjectURL(url)
+      setMsg('✅ Export réussi')
+    }catch{ setMsg('❌ Erreur lors de l\'export') }
   }
 
   function normalizeType(t){
@@ -313,12 +421,27 @@ function EquipmentsAdmin(){
       <div style={ui.bar}>
         <button style={ui.btn} onClick={openCreate}>+ Nouvel équipement</button>
         <button style={ui.btn} onClick={downloadTemplate}>Modèle Excel</button>
+        <button style={ui.btn} onClick={exportAllToExcel}>📥 Exporter tout</button>
         <label style={ui.btn}>Importer CSV
           <input type="file" accept=".csv" style={{display:'none'}} onChange={onCsvFileSelected}/>
         </label>
         <label style={ui.btn}>Importer Excel
           <input type="file" accept=".xlsx,.xls" style={{display:'none'}} onChange={onExcelFileSelected}/>
         </label>
+        <button style={{...ui.btn, background:'linear-gradient(to right, #dc2626, #b91c1c)'}} onClick={deleteByType}>
+          🗑️ Supprimer par type
+        </button>
+        <button style={{...ui.btn, background:'linear-gradient(to right, #7f1d1d, #991b1b)'}} onClick={deleteAll}>
+          ⚠️ Tout supprimer
+        </button>
+        {selected.length > 0 && (
+          <button 
+            style={{...ui.btn, background:'linear-gradient(to right, #b91c1c, #991b1b)'}} 
+            onClick={onBulkDelete}
+          >
+            Supprimer ({selected.length})
+          </button>
+        )}
       </div>
 
       {/* Filtres avec inputs transparents */}
@@ -348,6 +471,14 @@ function EquipmentsAdmin(){
           <table style={{borderCollapse:'separate', borderSpacing:0, width:'100%'}}>
             <thead>
               <tr>
+                <th style={{...ui.th, width: 40}}>
+                  <input 
+                    type="checkbox" 
+                    checked={selected.length === items.length && items.length > 0}
+                    onChange={toggleSelectAll}
+                    style={{cursor: 'pointer'}}
+                  />
+                </th>
                 {['Nom','IP','Type','Modèle','Localisation','Statut','Actions'].map(h=>(
                   <th key={h} style={ui.th}>{h}</th>
                 ))}
@@ -355,7 +486,18 @@ function EquipmentsAdmin(){
             </thead>
             <tbody>
               {items.map((it, idx)=>(
-                <tr key={it.id} style={idx % 2 === 0 ? {background: 'rgba(0,0,0,0.1)'} : {}}>
+                <tr key={it.id} style={{
+                  ...(idx % 2 === 0 ? {background: 'rgba(0,0,0,0.1)'} : {}),
+                  ...(selected.includes(it.id) ? {background: 'rgba(220, 38, 38, 0.15)'} : {})
+                }}>
+                  <td style={ui.td}>
+                    <input 
+                      type="checkbox" 
+                      checked={selected.includes(it.id)}
+                      onChange={() => toggleSelect(it.id)}
+                      style={{cursor: 'pointer'}}
+                    />
+                  </td>
                   <td style={ui.td}>{it.name}</td>
                   <td style={ui.td}>{it.ip||'-'}</td>
                   <td style={ui.td}>{it.type}</td>
@@ -578,6 +720,7 @@ function UsersAdmin(){
             >
               <option>User</option>
               <option>Admin</option>
+              <option>SGM</option>
             </select>
           </div>
           <div style={{display:'flex', gap:8}}>

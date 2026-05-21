@@ -7,4 +7,3 @@ npm-debug.log
 README.md
 Dockerfile
 .dockerignore
-dist

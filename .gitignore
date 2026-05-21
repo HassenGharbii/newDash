@@ -14,6 +14,12 @@ venv/
 *.pyc
 __pycache__/
 
+# Base de données SQLite (données de production — ne pas committer)
+backend/data/app.db
+backend/data/backups/
+backend/data/*.db-shm
+backend/data/*.db-wal
+
 # Docker
 *.pid
 *.sock

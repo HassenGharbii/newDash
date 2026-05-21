@@ -116,4 +116,71 @@ VITE_NODE_ENV=development
 ```
 
 ---
+
+## 🧹 **6. NETTOYAGE DONNÉES DE TEST (17/11/2025)**
+
+### **Scripts de test supprimés**
+- ❌ `AddTestEquipment.ps1` - Équipements fictifs
+- ❌ `AddBandwidthTestData.ps1` - Données de bande passante simulées
+- ❌ `GenerateTestBandwidthData.ps1` - Génération de données de test
+- ❌ `QuickBandwidthData.ps1` - Insertion SQL de données de test
+- ❌ `SimpleBandwidthData.ps1` - Générateur simple de données simulées
+- ❌ `TestAutomation.ps1` - Script de test d'automatisation
+- ❌ `AddBandwidthData.ps1` - Données de test pour équipements
+- ❌ `AddRealData.ps1` - Données simulées avec profils fictifs
+
+**Total supprimé** : **8 scripts de test**
+
+### **Scripts de production conservés**
+
+#### **Monitoring réel (collecte de données)**
+- ✅ `PingEquipment.ps1` - Ping réel via Test-Connection
+- ✅ `CollectServerInfo.ps1` - WMI (Windows) / SSH (Linux)
+- ✅ `CollectSwitchInfo.ps1` - SNMP v2c (Cisco, HP, Juniper)
+- ✅ `BandwidthMonitor.ps1` - Monitoring bande passante
+- ✅ `AddRealBandwidthData.ps1` - Get-NetAdapterStatistics
+
+#### **Orchestration**
+- ✅ `ProductionMonitoring.ps1` - Orchestrateur principal
+- ✅ `AutomationManager.ps1` - Gestion tâches planifiées
+- ✅ `AlertManager.ps1` - Alertes système
+
+#### **Administration**
+- ✅ `Setup.ps1` - Configuration initiale
+- ✅ `DockerManager.ps1` - Gestion Docker
+- ✅ `BackupManager.ps1` - Sauvegardes
+- ✅ `DatabaseCheck.ps1` - Vérification DB
+- ✅ `AddEquipmentFromCsv.ps1` - Import CSV
+- ✅ `DeploymentGuide.ps1` - Guide déploiement
+
+**Total conservé** : **15 scripts production**
+
+### **Vérifications effectuées**
+- ✅ Backend : Aucune donnée de test hardcodée
+- ✅ Frontend : Aucune donnée simulée
+- ✅ Documentation : Pas de références aux scripts supprimés
+- ✅ Scripts restants : Aucune dépendance cassée
+
+### **Impact**
+- ✨ Environnement 100% production-ready
+- ✨ Pas de confusion entre test et production
+- ✨ Codebase plus propre et maintenable
+- ✨ Collecte uniquement de données réelles
+
+### **Workflow production**
+```powershell
+# 1. Ajouter des équipements réels
+.\scripts\AddEquipmentFromCsv.ps1
+
+# 2. Démarrer le monitoring (collecte réelle)
+.\scripts\ProductionMonitoring.ps1 -IntervalMinutes 5
+
+# 3. Vérifier les données collectées
+.\scripts\DatabaseCheck.ps1 info
+```
+
+**📖 Documentation** : Voir `SCRIPTS-PRODUCTION.md` pour la liste complète des scripts disponibles
+
+---
 **Dashboard Semmaris** - Version optimisée pour l'environnement de développement ✨
+**Dernière mise à jour** : 17 novembre 2025 - Nettoyage données de test

@@ -1,0 +1,507 @@
+# =====================================================
+# Script de Collecte d'Informations Switches
+# =====================================================
+# Ce script collecte en temps réel les informations des switches réseau
+# via SNMP et les envoie à l'API
+
+param(
+    [string]$ConfigFile = ".\config.json",
+    [int]$IntervalSeconds = 120,
+    [switch]$ContinuousMode = $false
+)
+
+# Charger la configuration
+if (-not (Test-Path $ConfigFile)) {
+    Write-Error "Fichier de configuration introuvable: $ConfigFile"
+    exit 1
+}
+
+$config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+$apiBase = $config.apiBase
+$ingestKey = $config.ingestKey
+
+# =====================================================
+# INSTALLATION ET VÉRIFICATION DU MODULE SNMP
+# =====================================================
+
+function Install-SNMPModule {
+    Write-Host "[SNMP] Vérification du module SNMP..." -ForegroundColor Yellow
+    
+    # Vérifier si le module Posh-SNMP est installé
+    if (-not (Get-Module -ListAvailable -Name Posh-SNMP)) {
+        Write-Host "[SNMP] Module Posh-SNMP non trouvé. Installation en cours..." -ForegroundColor Yellow
+        try {
+            Install-Module -Name Posh-SNMP -Force -Scope CurrentUser -AllowClobber
+            Import-Module Posh-SNMP
+            Write-Host "[SNMP] ✓ Module Posh-SNMP installé avec succès" -ForegroundColor Green
+        } catch {
+            Write-Warning "[SNMP] Impossible d'installer Posh-SNMP: $_"
+            Write-Host "[SNMP] Utilisation de SNMP natif Windows..." -ForegroundColor Yellow
+            return $false
+        }
+    } else {
+        Import-Module Posh-SNMP -ErrorAction SilentlyContinue
+        Write-Host "[SNMP] ✓ Module SNMP disponible" -ForegroundColor Green
+    }
+    return $true
+}
+
+# =====================================================
+# OIDs SNMP STANDARDS (RFC 1213 - MIB-II)
+# =====================================================
+
+$OIDs = @{
+    # System Group
+    sysDescr       = "1.3.6.1.2.1.1.1.0"      # Description du système
+    sysObjectID    = "1.3.6.1.2.1.1.2.0"      # Object ID du système
+    sysUpTime      = "1.3.6.1.2.1.1.3.0"      # Uptime en centisecondes
+    sysContact     = "1.3.6.1.2.1.1.4.0"      # Contact
+    sysName        = "1.3.6.1.2.1.1.5.0"      # Nom du système
+    sysLocation    = "1.3.6.1.2.1.1.6.0"      # Localisation
+    
+    # Interfaces Group
+    ifNumber       = "1.3.6.1.2.1.2.1.0"      # Nombre d'interfaces
+    ifDescr        = "1.3.6.1.2.1.2.2.1.2"    # Description interface
+    ifType         = "1.3.6.1.2.1.2.2.1.3"    # Type interface
+    ifSpeed        = "1.3.6.1.2.1.2.2.1.5"    # Vitesse interface
+    ifPhysAddress  = "1.3.6.1.2.1.2.2.1.6"    # Adresse MAC
+    ifAdminStatus  = "1.3.6.1.2.1.2.2.1.7"    # Statut admin (1=up, 2=down)
+    ifOperStatus   = "1.3.6.1.2.1.2.2.1.8"    # Statut opérationnel
+    ifInOctets     = "1.3.6.1.2.1.2.2.1.10"   # Octets entrants
+    ifOutOctets    = "1.3.6.1.2.1.2.2.1.16"   # Octets sortants
+    ifInErrors     = "1.3.6.1.2.1.2.2.1.14"   # Erreurs entrantes
+    ifOutErrors    = "1.3.6.1.2.1.2.2.1.20"   # Erreurs sortantes
+    
+    # IP Group
+    ipForwarding   = "1.3.6.1.2.1.4.1.0"      # IP Forwarding enabled
+    
+    # SNMP Group
+    snmpInPkts     = "1.3.6.1.2.1.11.1.0"     # Paquets SNMP reçus
+    snmpOutPkts    = "1.3.6.1.2.1.11.2.0"     # Paquets SNMP envoyés
+}
+
+# OIDs spécifiques Cisco
+$CiscoOIDs = @{
+    cpuUsage5sec   = "1.3.6.1.4.1.9.2.1.56.0"     # CPU 5 secondes
+    cpuUsage1min   = "1.3.6.1.4.1.9.2.1.57.0"     # CPU 1 minute
+    cpuUsage5min   = "1.3.6.1.4.1.9.2.1.58.0"     # CPU 5 minutes
+    memoryUsed     = "1.3.6.1.4.1.9.9.48.1.1.1.5.1"  # Mémoire utilisée
+    memoryFree     = "1.3.6.1.4.1.9.9.48.1.1.1.6.1"  # Mémoire libre
+    temperature    = "1.3.6.1.4.1.9.9.13.1.3.1.3"    # Température
+}
+
+# OIDs spécifiques HP/HPE
+$HPOIDs = @{
+    cpuUsage       = "1.3.6.1.4.1.11.2.14.11.5.1.9.6.1.0"  # CPU usage
+    memoryTotal    = "1.3.6.1.4.1.11.2.14.11.5.1.1.2.1.1.1.5"  # Mémoire totale
+    memoryFree     = "1.3.6.1.4.1.11.2.14.11.5.1.1.2.1.1.1.6"  # Mémoire libre
+}
+
+# =====================================================
+# FONCTION SNMP GET
+# =====================================================
+
+function Get-SNMPValue {
+    param(
+        [string]$IPAddress,
+        [string]$Community = "public",
+        [string]$OID,
+        [int]$Timeout = 3
+    )
+    
+    try {
+        # Utiliser snmpget.exe si disponible (SnmpSoft tools ou Net-SNMP)
+        $snmpPath = "C:\usr\bin\snmpget.exe"
+        if (Test-Path $snmpPath) {
+            $result = & $snmpPath -v2c -c $Community -t $Timeout $IPAddress $OID 2>$null
+            if ($result -match "=\s*(.+)$") {
+                return $Matches[1].Trim()
+            }
+        }
+        
+        # Sinon utiliser Invoke-SNMPGet si disponible
+        if (Get-Command Invoke-SNMPGet -ErrorAction SilentlyContinue) {
+            $result = Invoke-SNMPGet -IP $IPAddress -Community $Community -OID $OID -Timeout $Timeout
+            return $result.Data
+        }
+        
+        # Fallback: Utiliser l'API SNMP Windows native
+        $SNMP = New-Object -ComObject olePrn.OleSNMP
+        $SNMP.Open($IPAddress, $Community, 2, $Timeout * 1000)
+        $value = $SNMP.Get($OID)
+        $SNMP.Close()
+        return $value
+        
+    } catch {
+        Write-Verbose "Erreur SNMP GET $OID sur $IPAddress : $_"
+        return $null
+    }
+}
+
+# =====================================================
+# FONCTION SNMP WALK
+# =====================================================
+
+function Get-SNMPWalk {
+    param(
+        [string]$IPAddress,
+        [string]$Community = "public",
+        [string]$OID,
+        [int]$Timeout = 3
+    )
+    
+    try {
+        # Utiliser snmpwalk.exe si disponible
+        $snmpPath = "C:\usr\bin\snmpwalk.exe"
+        if (Test-Path $snmpPath) {
+            $results = & $snmpPath -v2c -c $Community -t $Timeout $IPAddress $OID 2>$null
+            return $results
+        }
+        
+        # Sinon utiliser Invoke-SNMPWalk si disponible
+        if (Get-Command Invoke-SNMPWalk -ErrorAction SilentlyContinue) {
+            $results = Invoke-SNMPWalk -IP $IPAddress -Community $Community -OID $OID -Timeout $Timeout
+            return $results
+        }
+        
+        return @()
+        
+    } catch {
+        Write-Verbose "Erreur SNMP WALK $OID sur $IPAddress : $_"
+        return @()
+    }
+}
+
+# =====================================================
+# COLLECTE D'INFORMATIONS SWITCH
+# =====================================================
+
+function Get-SwitchInfo {
+    param(
+        [string]$IPAddress,
+        [string]$Community = "public",
+        [string]$Vendor = "generic"
+    )
+    
+    Write-Host "[INFO] Collecte des informations du switch: $IPAddress" -ForegroundColor Cyan
+    
+    $data = @{
+        ip = $IPAddress
+        status = "offline"
+        last_check = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    }
+    
+    # Test de connectivité ICMP
+    $pingTest = Test-Connection -ComputerName $IPAddress -Count 1 -Quiet -ErrorAction SilentlyContinue
+    if (-not $pingTest) {
+        Write-Warning "[WARN] Switch $IPAddress ne répond pas au ping"
+        $data.error = "No ping response"
+        return $data
+    }
+    
+    Write-Host "[PING] ✓ Switch $IPAddress répond au ping" -ForegroundColor Green
+    
+    try {
+        # Informations système de base
+        $sysDescr = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $OIDs.sysDescr
+        $sysName = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $OIDs.sysName
+        $sysUpTime = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $OIDs.sysUpTime
+        $sysLocation = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $OIDs.sysLocation
+        $sysContact = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $OIDs.sysContact
+        
+        if (-not $sysDescr) {
+            Write-Warning "[WARN] Pas de réponse SNMP de $IPAddress (vérifiez la community string)"
+            $data.error = "No SNMP response"
+            return $data
+        }
+        
+        Write-Host "[SNMP] ✓ Réponse SNMP reçue" -ForegroundColor Green
+        
+        $data.status = "online"
+        $data.hostname = $sysName
+        $data.description = $sysDescr
+        $data.location = $sysLocation
+        $data.contact = $sysContact
+        
+        # Uptime (convertir centisecondes en heures)
+        if ($sysUpTime) {
+            $uptimeSeconds = [int64]$sysUpTime / 100
+            $data.uptime_hours = [math]::Round($uptimeSeconds / 3600, 2)
+        }
+        
+        # Déterminer le vendor depuis la description
+        if ($sysDescr -match "Cisco") {
+            $Vendor = "cisco"
+        } elseif ($sysDescr -match "HP|HPE|ProCurve") {
+            $Vendor = "hp"
+        } elseif ($sysDescr -match "Juniper") {
+            $Vendor = "juniper"
+        }
+        
+        $data.vendor = $Vendor
+        
+        # Informations spécifiques au vendor
+        switch ($Vendor.ToLower()) {
+            "cisco" {
+                Write-Host "[CISCO] Collecte des informations spécifiques Cisco..." -ForegroundColor Yellow
+                
+                $cpuUsage = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $CiscoOIDs.cpuUsage5sec
+                if ($cpuUsage) { $data.cpu_usage_percent = [int]$cpuUsage }
+                
+                $memUsed = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $CiscoOIDs.memoryUsed
+                $memFree = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $CiscoOIDs.memoryFree
+                
+                if ($memUsed -and $memFree) {
+                    $memTotal = [int64]$memUsed + [int64]$memFree
+                    $data.memory_total_mb = [math]::Round($memTotal / 1MB, 2)
+                    $data.memory_used_mb = [math]::Round([int64]$memUsed / 1MB, 2)
+                    $data.memory_usage_percent = [math]::Round(([int64]$memUsed / $memTotal) * 100, 2)
+                }
+                
+                $temp = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $CiscoOIDs.temperature
+                if ($temp) { $data.temperature_celsius = [int]$temp }
+            }
+            
+            "hp" {
+                Write-Host "[HP] Collecte des informations spécifiques HP/HPE..." -ForegroundColor Yellow
+                
+                $cpuUsage = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $HPOIDs.cpuUsage
+                if ($cpuUsage) { $data.cpu_usage_percent = [int]$cpuUsage }
+                
+                $memTotal = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $HPOIDs.memoryTotal
+                $memFree = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $HPOIDs.memoryFree
+                
+                if ($memTotal -and $memFree) {
+                    $data.memory_total_mb = [math]::Round([int64]$memTotal / 1024, 2)
+                    $data.memory_free_mb = [math]::Round([int64]$memFree / 1024, 2)
+                    $data.memory_used_mb = $data.memory_total_mb - $data.memory_free_mb
+                    $data.memory_usage_percent = [math]::Round(($data.memory_used_mb / $data.memory_total_mb) * 100, 2)
+                }
+            }
+        }
+        
+        # Collecte des informations sur les interfaces
+        Write-Host "[PORTS] Collecte des informations sur les ports..." -ForegroundColor Yellow
+        
+        $ifNumber = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID $OIDs.ifNumber
+        $data.interface_count = [int]$ifNumber
+        
+        # Récupérer les statistiques des interfaces (premiers 24 ports)
+        $interfaces = @()
+        $maxPorts = [math]::Min(24, [int]$ifNumber)
+        
+        for ($i = 1; $i -le $maxPorts; $i++) {
+            $ifDescr = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID "$($OIDs.ifDescr).$i"
+            $ifOperStatus = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID "$($OIDs.ifOperStatus).$i"
+            $ifSpeed = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID "$($OIDs.ifSpeed).$i"
+            $ifInOctets = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID "$($OIDs.ifInOctets).$i"
+            $ifOutOctets = Get-SNMPValue -IPAddress $IPAddress -Community $Community -OID "$($OIDs.ifOutOctets).$i"
+            
+            if ($ifDescr) {
+                $interface = @{
+                    index = $i
+                    name = $ifDescr
+                    status = if ($ifOperStatus -eq "1") { "up" } else { "down" }
+                    speed_mbps = if ($ifSpeed) { [math]::Round([int64]$ifSpeed / 1000000, 0) } else { 0 }
+                    in_octets = [int64]$ifInOctets
+                    out_octets = [int64]$ifOutOctets
+                }
+                $interfaces += $interface
+            }
+        }
+        
+        $data.interfaces = $interfaces
+        $data.ports_up = ($interfaces | Where-Object { $_.status -eq "up" }).Count
+        $data.ports_down = ($interfaces | Where-Object { $_.status -eq "down" }).Count
+        
+        Write-Host "[OK] Collecte réussie - $($data.hostname) - $($data.ports_up)/$($data.interface_count) ports actifs" -ForegroundColor Green
+        
+        if ($data.cpu_usage_percent) {
+            Write-Host "      CPU: $($data.cpu_usage_percent)%" -ForegroundColor Gray
+        }
+        if ($data.memory_usage_percent) {
+            Write-Host "      RAM: $($data.memory_usage_percent)%" -ForegroundColor Gray
+        }
+        if ($data.temperature_celsius) {
+            Write-Host "      Temp: $($data.temperature_celsius)°C" -ForegroundColor Gray
+        }
+        
+        return $data
+        
+    } catch {
+        Write-Error "[ERREUR] Erreur lors de la collecte SNMP: $($_.Exception.Message)"
+        $data.error = $_.Exception.Message
+        return $data
+    }
+}
+
+# =====================================================
+# ENVOI DES DONNÉES À L'API
+# =====================================================
+
+function Send-SwitchData {
+    param(
+        [hashtable]$SwitchData,
+        [int]$EquipmentId
+    )
+    
+    $ingestUrl = "$apiBase/ingest/switch"
+    $headers = @{
+        "X-Ingest-Key" = $ingestKey
+        "Content-Type" = "application/json"
+    }
+    
+    $SwitchData.equipment_id = $EquipmentId
+    
+    $jsonBody = $SwitchData | ConvertTo-Json -Depth 10
+    
+    try {
+        $response = Invoke-RestMethod -Uri $ingestUrl -Method POST -Body $jsonBody -Headers $headers
+        Write-Host "[API] ✓ Données envoyées avec succès pour l'équipement ID: $EquipmentId" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Error "[API] ✗ Erreur lors de l'envoi des données: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# =====================================================
+# RÉCUPÉRATION DE LA LISTE DES SWITCHES
+# =====================================================
+
+function Get-SwitchesFromAPI {
+    param([string]$Token)
+    
+    $headers = @{
+        "Authorization" = "Bearer $Token"
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri "$apiBase/equipment?type=switch" -Method GET -Headers $headers
+        return $response | Where-Object { $_.category -eq 'switches' }
+    } catch {
+        Write-Error "[API] Erreur lors de la récupération des switches: $_"
+        return @()
+    }
+}
+
+# =====================================================
+# FONCTION D'AUTHENTIFICATION
+# =====================================================
+
+function Get-AuthToken {
+    param($apiBase, $email, $password)
+    
+    $loginUrl = "$apiBase/auth/login"
+    $loginBody = @{
+        identifier = $email
+        password = $password
+    } | ConvertTo-Json
+    
+    try {
+        $response = Invoke-RestMethod -Uri $loginUrl -Method POST -Body $loginBody -ContentType "application/json"
+        return $response.token
+    } catch {
+        Write-Error "Échec de l'authentification: $_"
+        return $null
+    }
+}
+
+# =====================================================
+# SCRIPT PRINCIPAL
+# =====================================================
+
+Write-Host "╔════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║  Collecte d'Informations Switches - Dashboard Semmaris  ║" -ForegroundColor Cyan
+Write-Host "╚════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host ""
+
+# Vérifier/Installer le module SNMP
+$snmpAvailable = Install-SNMPModule
+Write-Host ""
+
+# Authentification
+Write-Host "[AUTH] Authentification à l'API..." -ForegroundColor Yellow
+$token = Get-AuthToken -apiBase $apiBase -email $config.adminEmail -password $config.adminPassword
+
+if (-not $token) {
+    Write-Error "[AUTH] Impossible de s'authentifier"
+    exit 1
+}
+
+Write-Host "[AUTH] ✓ Authentification réussie" -ForegroundColor Green
+Write-Host ""
+
+# Récupération des switches
+Write-Host "[LOAD] Récupération de la liste des switches..." -ForegroundColor Yellow
+$switches = Get-SwitchesFromAPI -Token $token
+
+if ($switches.Count -eq 0) {
+    Write-Warning "[WARN] Aucun switch trouvé dans la base de données"
+    exit 0
+}
+
+Write-Host "[LOAD] ✓ $($switches.Count) switch(es) trouvé(s)" -ForegroundColor Green
+Write-Host ""
+
+# Boucle principale (continue ou single run)
+$mode = if ($ContinuousMode) { 'Continu' } else { 'Single' }
+Write-Host "[INFO] Mode: $mode - Intervalle: ${IntervalSeconds}s" -ForegroundColor Cyan
+Write-Host ""
+
+do {
+    # Collecter les informations de chaque switch
+    $successCount = 0
+    $failCount = 0
+    $cycleStart = Get-Date
+
+    foreach ($switch in $switches) {
+        Write-Host "-------------------------------------------------------" -ForegroundColor Gray
+        Write-Host "[SWITCH] $($switch.name) ($($switch.ip))" -ForegroundColor Cyan
+        
+        # Community string (utiliser celle de la DB ou "public" par defaut)
+        $community = if ($switch.snmp_community) { $switch.snmp_community } else { "public" }
+        
+        # Collecter les informations
+        $switchData = Get-SwitchInfo -IPAddress $switch.ip -Community $community -Vendor $switch.vendor
+        
+        # Envoyer les donnees
+        if ($switchData.status -eq "online") {
+            $sent = Send-SwitchData -SwitchData $switchData -EquipmentId $switch.id
+            if ($sent) {
+                $successCount++
+                Write-Host "[OK] Donnees envoyees" -ForegroundColor Green
+            } else {
+                $failCount++
+            }
+        } else {
+            Write-Warning "[WARN] Switch offline ou inaccessible"
+            $failCount++
+        }
+        
+        Write-Host ""
+        Start-Sleep -Milliseconds 500
+    }
+
+    # Resume du cycle
+    $cycleDuration = ((Get-Date) - $cycleStart).TotalSeconds
+    Write-Host "-------------------------------------------------------" -ForegroundColor Gray
+    Write-Host "[CYCLE] Termine en $([math]::Round($cycleDuration, 1))s" -ForegroundColor Green
+    Write-Host "  Succes: $successCount" -ForegroundColor Green
+    Write-Host "  Echecs: $failCount" -ForegroundColor Red
+    Write-Host "  Total: $($switches.Count)" -ForegroundColor Cyan
+    Write-Host "  Heure: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
+    
+    if ($ContinuousMode) {
+        Write-Host "  Prochain cycle dans ${IntervalSeconds}s..." -ForegroundColor Yellow
+        Write-Host ""
+        Start-Sleep -Seconds $IntervalSeconds
+        
+        # Re-authentifier et recharger les switches
+        $token = Get-AuthToken -apiBase $apiBase -email $config.adminEmail -password $config.adminPassword
+        if ($token) {
+            $switches = Get-SwitchesFromAPI -Token $token
+        }
+    }
+    Write-Host ""
+} while ($ContinuousMode)

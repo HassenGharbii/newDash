@@ -18,7 +18,7 @@ function Invoke-JsonPost($url, $body, $headers=@{}) {
 
 # Login
 try {
-  $login = Invoke-JsonPost "$apiBase/auth/login" @{ email = $adminEmail; password = $adminPassword }
+  $login = Invoke-JsonPost "$apiBase/auth/login" @{ identifier = $adminEmail; password = $adminPassword }
   $token = $login.token
   if (-not $token) { throw "No token returned" }
 } catch {
