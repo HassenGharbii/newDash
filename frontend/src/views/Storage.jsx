@@ -1,4 +1,5 @@
 import React from 'react'
+import Sparkline from '../components/Sparkline.jsx'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 const authHeader = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token') || ''}` })
@@ -126,7 +127,33 @@ function StorageCard({ baie, onSelect, isSelected }) {
   )
 }
 
-function StorageDetail({ baie }) {
+function HistorySection({ history }) {
+  const capacityPct = history.map(h => h.capacity_used_pct).filter(v => v !== null && v !== undefined)
+  const capacityTb = history.map(h => h.capacity_used_tb).filter(v => v !== null && v !== undefined)
+  const failedDisks = history.map(h => h.disks_failed).filter(v => v !== null && v !== undefined)
+
+  return (
+    <div style={{ padding: '16px', background: '#f8fafc', borderRadius: '10px', border: '1px solid #e5e7eb', marginBottom: '16px' }}>
+      <div style={{ fontWeight: '600', color: '#374151', marginBottom: '12px' }}>Historique (24h)</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px' }}>
+        <div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px' }}>Capacité utilisée %</div>
+          <Sparkline data={capacityPct} color="#3b82f6" suffix="%" />
+        </div>
+        <div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px' }}>Capacité utilisée (To)</div>
+          <Sparkline data={capacityTb} color="#1d4ed8" />
+        </div>
+        <div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px' }}>Disques en défaut</div>
+          <Sparkline data={failedDisks} color="#dc2626" />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function StorageDetail({ baie, history }) {
   const info = baie.info_json || {}
   const controllers = info.controllers || []
   const pools = info.pools || []
@@ -182,6 +209,9 @@ function StorageDetail({ baie }) {
           </div>
         )}
       </div>
+
+      {/* Historique */}
+      <HistorySection history={history} />
 
       {/* Contrôleurs */}
       {controllers.length > 0 && (
@@ -246,6 +276,7 @@ function StorageDetail({ baie }) {
 export default function Storage() {
   const [baies, setBaies] = React.useState([])
   const [selected, setSelected] = React.useState(null)
+  const [history, setHistory] = React.useState([])
   const [loading, setLoading] = React.useState(true)
 
   const fetchBaies = React.useCallback(async () => {
@@ -269,6 +300,16 @@ export default function Storage() {
     const id = setInterval(fetchBaies, 60000)
     return () => clearInterval(id)
   }, [fetchBaies])
+
+  React.useEffect(() => {
+    if (!selected) { setHistory([]); return }
+    let cancelled = false
+    fetch(`${API}/metrics/storage/${selected.id}/history?hours=24`, { headers: authHeader() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => { if (!cancelled) setHistory(Array.isArray(data) ? data : []) })
+      .catch(() => { if (!cancelled) setHistory([]) })
+    return () => { cancelled = true }
+  }, [selected?.id])
 
   const totalCapacity = baies.reduce((a, b) => a + (b.info_json?.capacity_total_tb || 0), 0)
   const usedCapacity = baies.reduce((a, b) => a + (b.info_json?.capacity_used_tb || 0), 0)
@@ -339,7 +380,7 @@ export default function Storage() {
 
         {/* Détail baie sélectionnée */}
         {selected && (
-          <StorageDetail baie={{ ...selected, info_json: selected.info_json || {} }} />
+          <StorageDetail baie={{ ...selected, info_json: selected.info_json || {} }} history={history} />
         )}
       </div>
     </div>

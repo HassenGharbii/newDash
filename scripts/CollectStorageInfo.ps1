@@ -18,17 +18,17 @@ param(
     [string[]]$StorageHosts   = @(),
 
     # SNMP
-    [string]$SnmpCommunity    = $env:SNMP_COMMUNITY ?? "public",
+    [string]$SnmpCommunity    = $(if ($env:SNMP_COMMUNITY) { $env:SNMP_COMMUNITY } else { "public" }),
     [int]$SnmpPort            = 161,
 
     # API REST Seagate Systems Management Console (HTTPS)
-    [string]$ApiUser          = $env:SEAGATE_USER ?? "manage",
-    [string]$ApiPass          = $env:SEAGATE_PASS ?? "!manage",
+    [string]$ApiUser          = $(if ($env:SEAGATE_USER) { $env:SEAGATE_USER } else { "manage" }),
+    [string]$ApiPass          = $env:SEAGATE_PASS,
     [int]$ApiPort             = 443,
 
     # Dashboard API
-    [string]$DashboardApiUrl  = $env:API_URL    ?? "http://localhost:4000",
-    [string]$IngestKey        = $env:INGEST_KEY ?? "dev-ingest-key"
+    [string]$DashboardApiUrl  = $(if ($env:API_URL) { $env:API_URL } else { "http://localhost:4000" }),
+    [string]$IngestKey        = $(if ($env:INGEST_KEY) { $env:INGEST_KEY } else { "dev-ingest-key" })
 )
 
 Set-StrictMode -Version Latest
@@ -66,7 +66,7 @@ function Send-StorageData {
             -Method POST -Headers $headers -Body $body -TimeoutSec 15
         Write-Log "INFO" "✅ $($Data.name) envoyé (ID: $($response.equipment_id))"
     } catch {
-        Write-Log "WARN" "❌ Erreur envoi $($Data.name ?? $Data.ip): $($_.Exception.Message)"
+        Write-Log "WARN" "❌ Erreur envoi $(if ($Data.name) { $Data.name } else { $Data.ip }): $($_.Exception.Message)"
     }
 }
 
@@ -125,8 +125,10 @@ function Collect-SeagateREST {
             -Headers $apiHeaders -TimeoutSec 10
         $pools = $poolInfo.objects
 
-        $totalCapGB  = ($pools | Measure-Object -Property total-size-numeric -Sum).Sum ?? 0
-        $usedCapGB   = ($pools | Measure-Object -Property allocated-size-numeric -Sum).Sum ?? 0
+        $totalCapGBRaw = ($pools | Measure-Object -Property total-size-numeric -Sum).Sum
+        $totalCapGB  = if ($null -ne $totalCapGBRaw) { $totalCapGBRaw } else { 0 }
+        $usedCapGBRaw = ($pools | Measure-Object -Property allocated-size-numeric -Sum).Sum
+        $usedCapGB   = if ($null -ne $usedCapGBRaw) { $usedCapGBRaw } else { 0 }
         $freeCapGB   = $totalCapGB - $usedCapGB
         $totalCapTB  = [math]::Round($totalCapGB / 1024, 2)
         $usedCapTB   = [math]::Round($usedCapGB / 1024, 2)
@@ -147,7 +149,7 @@ function Collect-SeagateREST {
             @{
                 name   = $_.id
                 status = if ($_.health -eq "OK") { "ok" } else { "fault" }
-                role   = if ($_.redundancy-status -eq "ACTIVE") { "Actif" } else { "Passif/Secours" }
+                role   = if ($_.'redundancy-status' -eq "ACTIVE") { "Actif" } else { "Passif/Secours" }
             }
         }
 
@@ -156,18 +158,18 @@ function Collect-SeagateREST {
             @{
                 name        = $_.name
                 raid_level  = $_.'storage-type'
-                capacity_gb = [math]::Round(($_.'total-size-numeric' ?? 0), 0)
-                used_gb     = [math]::Round(($_.'allocated-size-numeric' ?? 0), 0)
+                capacity_gb = [math]::Round($(if ($null -ne $_.'total-size-numeric') { $_.'total-size-numeric' } else { 0 }), 0)
+                used_gb     = [math]::Round($(if ($null -ne $_.'allocated-size-numeric') { $_.'allocated-size-numeric' } else { 0 }), 0)
                 health      = $_.health
             }
         }
 
         $data = @{
             ip                 = $StorageIp
-            name               = $sys.'system-name' ?? "Seagate-$StorageIp"
-            model              = $sys.'product-id' ?? "Exos X 5U84"
-            serial_number      = $sys.'midplane-serial-number' ?? ""
-            firmware_version   = $sys.'bundle-version' ?? ""
+            name               = $(if ($sys.'system-name') { $sys.'system-name' } else { "Seagate-$StorageIp" })
+            model              = $(if ($sys.'product-id') { $sys.'product-id' } else { "Exos X 5U84" })
+            serial_number      = $(if ($sys.'midplane-serial-number') { $sys.'midplane-serial-number' } else { "" })
+            firmware_version   = $(if ($sys.'bundle-version') { $sys.'bundle-version' } else { "" })
             health             = $sys.health
             overall_status     = if ($sys.health -eq "OK") { "OK" } else { "Fault" }
             capacity_total_tb  = $totalCapTB

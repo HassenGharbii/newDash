@@ -1,5 +1,9 @@
 ﻿# StartAllMonitors.ps1 - Lance tous les scripts de monitoring
-$scriptsPath = "C:\Users\Axone\Documents\Dashboard-Semmaris-Base-Propre\scripts"
+param(
+    [string]$ApiUrl = $env:API_URL
+)
+
+$scriptsPath = $PSScriptRoot
 $logFile = Join-Path $scriptsPath "..\logs\monitors-startup.log"
 $maxRetries = 5
 $retryDelay = 30
@@ -21,7 +25,10 @@ Write-Log "DÃ©marrage des Monitors Semmaris"
 Write-Log "=========================================="
 
 # Attendre que l'API soit disponible
-$apiUrl = "http://10.8.11.230:4000"
+$apiUrl = if ($ApiUrl) { $ApiUrl } else {
+    $cfgPath = Join-Path $scriptsPath "config.json"
+    if (Test-Path $cfgPath) { (Get-Content $cfgPath -Raw | ConvertFrom-Json).apiBase } else { "http://localhost:4000" }
+}
 $retry = 0
 while ($retry -lt $maxRetries) {
     try {

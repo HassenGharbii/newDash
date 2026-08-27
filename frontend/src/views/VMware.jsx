@@ -1,4 +1,5 @@
 import React from 'react'
+import Sparkline from '../components/Sparkline.jsx'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 const authHeader = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token') || ''}` })
@@ -117,7 +118,33 @@ function HyperviseurCard({ host, onSelect, isSelected }) {
   )
 }
 
-function HyperviseurDetail({ host }) {
+function HistorySection({ history }) {
+  const cpu = history.map(h => h.cpu_usage_pct).filter(v => v !== null && v !== undefined)
+  const ram = history.map(h => h.memory_usage_pct).filter(v => v !== null && v !== undefined)
+  const vms = history.map(h => h.vm_total).filter(v => v !== null && v !== undefined)
+
+  return (
+    <div style={{ padding: '16px', background: '#f8fafc', borderRadius: '10px', border: '1px solid #e5e7eb', marginBottom: '16px' }}>
+      <div style={{ fontWeight: '600', color: '#374151', marginBottom: '12px' }}>Historique (24h)</div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px' }}>
+        <div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px' }}>CPU %</div>
+          <Sparkline data={cpu} color="#ef4444" suffix="%" />
+        </div>
+        <div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px' }}>RAM %</div>
+          <Sparkline data={ram} color="#f59e0b" suffix="%" />
+        </div>
+        <div>
+          <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '6px' }}>VMs</div>
+          <Sparkline data={vms} color="#2563eb" />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function HyperviseurDetail({ host, history }) {
   const info = host.info_json || {}
   const datastores = info.datastores || []
 
@@ -173,6 +200,9 @@ function HyperviseurDetail({ host }) {
         </div>
       </div>
 
+      {/* Historique */}
+      <HistorySection history={history} />
+
       {/* Datastores */}
       {datastores.length > 0 && (
         <div style={{ padding: '16px', background: '#f8fafc', borderRadius: '10px', border: '1px solid #e5e7eb', marginBottom: '16px' }}>
@@ -207,6 +237,7 @@ function HyperviseurDetail({ host }) {
 export default function VMware() {
   const [hosts, setHosts] = React.useState([])
   const [selected, setSelected] = React.useState(null)
+  const [history, setHistory] = React.useState([])
   const [loading, setLoading] = React.useState(true)
 
   const fetchHosts = React.useCallback(async () => {
@@ -230,6 +261,16 @@ export default function VMware() {
     const id = setInterval(fetchHosts, 30000)
     return () => clearInterval(id)
   }, [fetchHosts])
+
+  React.useEffect(() => {
+    if (!selected) { setHistory([]); return }
+    let cancelled = false
+    fetch(`${API}/metrics/hyperviseur/${selected.id}/history?hours=24`, { headers: authHeader() })
+      .then(res => res.ok ? res.json() : [])
+      .then(data => { if (!cancelled) setHistory(Array.isArray(data) ? data : []) })
+      .catch(() => { if (!cancelled) setHistory([]) })
+    return () => { cancelled = true }
+  }, [selected?.id])
 
   const totalVMs = hosts.reduce((acc, h) => acc + (h.info_json?.vm_total || 0), 0)
   const runningVMs = hosts.reduce((acc, h) => acc + (h.info_json?.vm_running || 0), 0)
@@ -297,7 +338,7 @@ export default function VMware() {
 
         {/* Détail du host sélectionné */}
         {selected && (
-          <HyperviseurDetail host={{ ...selected, info_json: selected.info_json || {} }} />
+          <HyperviseurDetail host={{ ...selected, info_json: selected.info_json || {} }} history={history} />
         )}
       </div>
     </div>

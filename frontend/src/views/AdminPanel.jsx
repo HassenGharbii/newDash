@@ -129,7 +129,7 @@ const ui = {
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000'
 const authHeader = () => ({ 'Authorization': `Bearer ${localStorage.getItem('token')||''}` })
 const jsonHeader = () => ({ ...authHeader(), 'Content-Type':'application/json' })
-const ALLOWED_TYPES = ['Server','Switch','Camera','PC']
+const ALLOWED_TYPES = ['Server','Switch','Camera','PC','Hyperviseur','Stockage']
 
 export default function AdminPanel(){
   const [tab, setTab] = React.useState('equip')
@@ -372,7 +372,9 @@ function EquipmentsAdmin(){
     if(s.startsWith('sw'))   return 'Switch'
     if(s.startsWith('cam'))  return 'Camera'
     if(s==='pc')             return 'PC'
-    if(['server','switch','camera','pc'].includes(s)) return s[0].toUpperCase()+s.slice(1)
+    if(s==='hyperviseur' || s==='hypervisor' || s==='esxi' || s==='vmware') return 'Hyperviseur'
+    if(s==='stockage' || s==='storage' || s==='baie' || s==='san' || s==='nas') return 'Stockage'
+    if(['server','switch','camera','pc','hyperviseur','stockage'].includes(s)) return s[0].toUpperCase()+s.slice(1)
     return 'PC'
   }
   function detectDelimiter(h){ const D=[',',';','\t','|']; let b=',',m=-1; for(const d of D){ const c=(h.match(new RegExp(d.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'g'))||[]).length; if(c>m){m=c;b=d}} if(b!==';' && h.includes(';')) b=';'; return b }

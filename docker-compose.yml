@@ -5,9 +5,11 @@ services:
       - "4000:4000"
     environment:
       - PORT=4000
-      - JWT_SECRET=change-me-please
+      - JWT_SECRET=${JWT_SECRET:-change-me-please}
       - DB_PATH=./data/app.db
-      - INGEST_KEY=change-me-strong
+      - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+      - ADMIN_SEED_PASSWORD=${ADMIN_SEED_PASSWORD:-}
+      - USER_SEED_PASSWORD=${USER_SEED_PASSWORD:-}
     volumes:
       - ./backend/data:/app/data
     restart: always
@@ -15,23 +17,28 @@ services:
     build:
       context: ./frontend
       args:
-        - VITE_API_URL=http://localhost:4000
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:4000}
     environment:
-      - VITE_API_URL=http://localhost:4000
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:4000}
     ports:
       - "3001:5173"
     depends_on:
       - api
+  # NOTE: this container still won't fully work as-is - CollectSwitchBandwidth.ps1
+  # shells out to SnmpWalk.exe, a native Windows binary, which cannot run inside
+  # this Linux-based powershell image regardless of the script path. Either run
+  # bandwidth collection on the Windows monitoring host (StartAllMonitors.ps1)
+  # instead of via Docker, or port the script to a Linux SNMP client.
   ping-monitor:
     build:
       context: .
       dockerfile: docker/monitor/Dockerfile
     image: semmaris/monitors:latest
     working_dir: /opt/monitors
-    command: /opt/monitors/PingEquipment.ps1
+    command: /opt/monitors/SimplePing.ps1
     environment:
       - API_URL=http://api:4000
-      - INGEST_KEY=change-me-strong
+      - INGEST_KEY=${INGEST_KEY:-change-me-strong}
     depends_on:
       - api
     restart: always
@@ -42,7 +49,10 @@ services:
       dockerfile: docker/monitor/Dockerfile
     image: semmaris/monitors:latest
     working_dir: /opt/monitors
-    command: /opt/monitors/BandwidthMonitor.ps1 -ApiUrl http://api:4000 -ApiKey change-me-strong
+    command: /opt/monitors/CollectSwitchBandwidth.ps1 -IntervalSeconds 60
+    environment:
+      - API_URL=http://api:4000
+      - INGEST_KEY=${INGEST_KEY:-change-me-strong}
     depends_on:
       - api
     restart: always

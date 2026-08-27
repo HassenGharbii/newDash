@@ -316,149 +316,159 @@ Le champ `type` est normalisé côté API : les variantes (`vmware`, `esxi`, `hy
 
 ---
 
-## 9. API Backend — endpoints documentés
+## 9. API Backend — endpoints réels
 
-L'API tourne sur le port **4000**. Toutes les routes (sauf `/api/auth/*`) requièrent un header `Authorization: Bearer <token>`.
+L'API tourne sur le port **4000** (configurable via `PORT`). Les routes protégées requièrent un header `Authorization: Bearer <token>`. Les routes d'ingestion utilisées par les scripts PowerShell requièrent le header `x-ingest-key: <INGEST_KEY>` (exception : `/bandwidth/ingest` utilise `x-api-key`, avec la même valeur que `INGEST_KEY`).
 
-Les routes d'ingestion de métriques (utilisées par les scripts PowerShell) requièrent le header `x-ingest-key: <INGEST_KEY>`.
+Cette section reflète le code réel de `backend/src/index.js` — vérifiée le 2026-08-26.
+
+### Santé
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/health` | Sonde de santé, sans authentification |
 
 ### Authentification
 
 | Méthode | Route | Corps | Description |
 |---------|-------|-------|-------------|
-| `POST` | `/api/auth/login` | `{ identifier, password }` | Connexion — retourne `{ token, user }` |
-| `GET` | `/api/auth/me` | — | Profil de l'utilisateur connecté |
-| `PUT` | `/api/auth/password` | `{ currentPassword, newPassword }` | Changement de mot de passe |
+| `POST` | `/auth/login` | `{ identifier, password }` | Connexion — retourne `{ token, user }` |
+| `POST` | `/auth/refresh` | — | Rafraîchit le token |
+| `GET` | `/auth/me` | — | Profil de l'utilisateur connecté |
+
+### Utilisateurs (Admin)
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/users` | Liste des utilisateurs |
+| `POST` | `/users` | Créer un utilisateur |
+| `PUT` | `/users/:id` | Modifier un utilisateur (y compris mot de passe) |
+| `DELETE` | `/users/:id` | Supprimer un utilisateur |
 
 ### Équipements
 
 | Méthode | Route | Description |
 |---------|-------|-------------|
-| `GET` | `/api/equipment` | Liste tous les équipements (filtres : `?type=Camera&status=online`) |
-| `GET` | `/api/equipment/:id` | Détail d'un équipement |
-| `POST` | `/api/equipment` | Créer un équipement (Admin) |
-| `PUT` | `/api/equipment/:id` | Modifier un équipement (Admin) |
-| `DELETE` | `/api/equipment/:id` | Supprimer un équipement (Admin) |
-| `POST` | `/api/equipment/import` | Import CSV/Excel (Admin) |
+| `GET` | `/equipment` | Liste (`?type=`, pagination `?page&pageSize`, ou `?limit`) |
+| `GET` | `/equipment/search` | Recherche |
+| `POST` | `/equipment` | Créer (Admin) |
+| `PUT` | `/equipment/:id` | Modifier (Admin) |
+| `DELETE` | `/equipment/:id` | Supprimer (Admin) |
+| `POST` | `/equipment/bulk-delete` | Suppression multiple (Admin) |
+| `DELETE` | `/equipment/delete-by-type/:type` | Supprimer par type (Admin) |
+| `DELETE` | `/equipment/delete-all` | Supprimer tout (Admin) |
+| `POST` | `/equipment/bulk` | Import CSV en masse (Admin) |
+| `POST` | `/equipment/bulk-excel` | Import Excel (Admin) |
+| `GET` | `/equipment/template-excel` | Télécharger le modèle Excel |
+| `GET` | `/equipment/export-excel` | Exporter l'inventaire en Excel (Admin) |
 
-### Métriques réseau
-
-| Méthode | Route | Description |
-|---------|-------|-------------|
-| `POST` | `/api/ping/ingest` | Ingestion des résultats de ping (script) |
-| `GET` | `/api/ping/latest` | Derniers résultats de ping |
-| `POST` | `/api/bandwidth/ingest` | Ingestion bande passante (script) |
-| `GET` | `/api/bandwidth/latest` | Dernières métriques bande passante |
-
-### VMware / Hyperviseurs
+### Ingestion monitoring (scripts PowerShell → API)
 
 | Méthode | Route | Description |
 |---------|-------|-------------|
-| `POST` | `/api/hyperviseur/ingest` | Ingestion métriques ESXi (PowerCLI) |
-| `GET` | `/api/hyperviseur/metrics` | Métriques de tous les hyperviseurs |
-| `GET` | `/api/hyperviseur/metrics/:id` | Métriques d'un hyperviseur |
+| `POST` | `/ingest/ping` | Ping unitaire |
+| `POST` | `/ingest/ping/batch` | Pings en lot |
+| `POST` | `/ingest/server` | Infos serveur |
+| `POST` | `/ingest/server-metrics` | Métriques serveur |
+| `POST` | `/ingest/switch-metrics` | Métriques switch |
+| `POST` | `/ingest/switch` | Infos switch (ports, etc.) |
+| `POST` | `/ingest/hyperviseur` | Métriques hyperviseur VMware ESXi (état courant + historique) |
+| `POST` | `/ingest/storage` | Métriques baie Seagate (état courant + historique) |
 
-### Stockage Seagate
-
-| Méthode | Route | Description |
-|---------|-------|-------------|
-| `POST` | `/api/storage/ingest` | Ingestion métriques baie Seagate |
-| `GET` | `/api/storage/metrics` | Métriques de toutes les baies |
-| `GET` | `/api/storage/metrics/:id` | Métriques d'une baie |
-
-### Utilisateurs (Admin uniquement)
+### Bande passante
 
 | Méthode | Route | Description |
 |---------|-------|-------------|
-| `GET` | `/api/users` | Liste des utilisateurs |
-| `POST` | `/api/users` | Créer un utilisateur |
-| `PUT` | `/api/users/:id` | Modifier un utilisateur |
-| `DELETE` | `/api/users/:id` | Supprimer un utilisateur |
+| `GET` | `/bandwidth` | Données de bande passante (`?hours=`, 24 par défaut) |
+| `POST` | `/bandwidth` | Créer un point de mesure (Admin) |
+| `POST` | `/bandwidth/ingest` | Ingestion (header `x-api-key`) |
+| `GET` | `/bandwidth/stats` | Statistiques de bande passante |
+
+### Métriques par équipement
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/metrics/server/:id` | Métriques courantes d'un serveur |
+| `GET` | `/metrics/switch/:id` | Métriques courantes d'un switch |
+| `GET` | `/metrics/hyperviseur/:id` | Métriques courantes d'un hyperviseur |
+| `GET` | `/metrics/hyperviseur/:id/history` | Historique (`?hours=`, 24 par défaut, max 720) |
+| `GET` | `/metrics/storage/:id` | Métriques courantes d'une baie |
+| `GET` | `/metrics/storage/:id/history` | Historique (`?hours=`, 24 par défaut, max 720) |
 
 ### Statistiques
 
 | Méthode | Route | Description |
 |---------|-------|-------------|
-| `GET` | `/api/stats` | Statistiques globales (uptime, counts, etc.) |
-| `GET` | `/api/stats/history` | Historique de disponibilité |
+| `GET` | `/stats/overview` | Totaux, up/down, par type |
+| `GET` | `/stats/history` | Tendances agrégées hyperviseurs/stockage (`?hours=`) |
 
 ---
 
-## 10. Base de données SQLite — schéma
+## 10. Base de données SQLite — schéma réel
 
-La base est dans `backend/data/app.db`, en **mode WAL** (Write-Ahead Logging) pour de meilleures performances en lecture concurrente. Elle est migrée automatiquement au démarrage de l'API.
+La base est dans `backend/data/app.db` (chemin configurable via `DB_PATH`), en **mode WAL**. Le schéma est créé/migré automatiquement au démarrage de l'API — voir `backend/src/index.js`. Vérifiée le 2026-08-26.
 
 ### Table `users`
 ```sql
-id          INTEGER PRIMARY KEY AUTOINCREMENT
-email       TEXT UNIQUE NOT NULL
-password    TEXT NOT NULL          -- bcrypt hash (cost 10)
-name        TEXT
-role        TEXT DEFAULT 'User'    -- 'Admin' | 'User' | 'SGM'
-created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+id             INTEGER PRIMARY KEY AUTOINCREMENT
+email          TEXT UNIQUE NOT NULL
+password_hash  TEXT NOT NULL
+role           TEXT NOT NULL CHECK (role IN ('Admin','User','SGM'))
+name           TEXT
+created_at     TEXT DEFAULT (datetime('now'))
 ```
 
 ### Table `equipment`
 ```sql
-id           INTEGER PRIMARY KEY AUTOINCREMENT
-name         TEXT NOT NULL
-type         TEXT NOT NULL          -- Camera | Switch | PC | Server | Hyperviseur | Stockage
-ip           TEXT
-location     TEXT                   -- Contient 'PCA1', 'PCA2' ou 'PRA' pour les sites
-status       TEXT DEFAULT 'unknown' -- online | offline | unknown
-description  TEXT
-created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
-updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP
-```
-
-### Table `ping_results`
-```sql
 id            INTEGER PRIMARY KEY AUTOINCREMENT
-equipment_id  INTEGER REFERENCES equipment(id)
-status        TEXT    -- online | offline
-latency_ms    REAL
-collected_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+name          TEXT NOT NULL
+type          TEXT NOT NULL           -- Camera | Switch | Server | PC | Hyperviseur | Stockage
+ip            TEXT
+model         TEXT
+location      TEXT                    -- pour PCA/PRA : doit contenir PCA1 / PCA2 / PRA (sous-chaîne, insensible à la casse)
+ping_status   TEXT DEFAULT 'UNKNOWN'  -- UP | DOWN | UNKNOWN
+latency_ms    INTEGER
+last_ping_at  TEXT
+last_info_at  TEXT
+info_json     TEXT                    -- état courant de la dernière collecte (structure dépend du type)
+created_at    TEXT DEFAULT (datetime('now'))
+updated_at    TEXT DEFAULT (datetime('now'))
 ```
 
-### Table `bandwidth_metrics`
-```sql
-id            INTEGER PRIMARY KEY AUTOINCREMENT
-equipment_id  INTEGER REFERENCES equipment(id)
-interface     TEXT
-rx_bps        REAL    -- débit entrant en bits/s
-tx_bps        REAL    -- débit sortant en bits/s
-collected_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-```
-
-### Table `hyperviseur_metrics`
+### Table `bandwidth_data`
 ```sql
 id              INTEGER PRIMARY KEY AUTOINCREMENT
-equipment_id    INTEGER REFERENCES equipment(id)
-cpu_usage_pct   REAL
-ram_usage_pct   REAL
-ram_total_gb    REAL
-ram_used_gb     REAL
-vm_running      INTEGER
-vm_stopped      INTEGER
-datastores      TEXT    -- JSON : [{ name, capacity_gb, free_gb, used_pct }]
-collected_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+timestamp       TEXT NOT NULL
+value_mbps      REAL NOT NULL
+interface_name  TEXT DEFAULT 'main'
+equipment_id    INTEGER
+equipment_type  TEXT
+created_at      TEXT DEFAULT (datetime('now'))
 ```
 
-### Table `storage_metrics`
+### Table `hyperviseur_metrics` (historique — alimentée par `POST /ingest/hyperviseur`)
+```sql
+id                 INTEGER PRIMARY KEY AUTOINCREMENT
+equipment_id       INTEGER NOT NULL
+cpu_usage_pct      REAL
+memory_usage_pct   REAL
+vm_total           INTEGER
+vm_running         INTEGER
+collected_at       TEXT NOT NULL DEFAULT (datetime('now'))
+```
+
+### Table `storage_metrics` (historique — alimentée par `POST /ingest/storage`)
 ```sql
 id                  INTEGER PRIMARY KEY AUTOINCREMENT
-equipment_id        INTEGER REFERENCES equipment(id)
-total_capacity_tb   REAL
-used_capacity_tb    REAL
-free_capacity_tb    REAL
-disks_total         INTEGER
-disks_ok            INTEGER
+equipment_id        INTEGER NOT NULL
+capacity_used_pct   REAL
+capacity_total_tb   REAL
+capacity_used_tb    REAL
 disks_failed        INTEGER
-disks_spare         INTEGER
-controllers_status  TEXT    -- JSON : [{ id, status, fw_version }]
-pools               TEXT    -- JSON : [{ name, status, raid_level, size_tb }]
-collected_at        DATETIME DEFAULT CURRENT_TIMESTAMP
+collected_at        TEXT NOT NULL DEFAULT (datetime('now'))
 ```
+
+Aucune suppression automatique n'est appliquée sur les deux tables d'historique pour l'instant — à surveiller si la fréquence de collecte augmente significativement (pas de `ping_results` ni `bandwidth_metrics` séparées : le ping vit dans `equipment.ping_status`/`last_ping_at`, la bande passante dans `bandwidth_data`).
 
 ### Persistance Docker
 

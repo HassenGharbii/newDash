@@ -11,8 +11,13 @@ coverage/
 # Backend (Node/Python)
 venv/
 .env
+.env.*
+!.env.example
 *.pyc
 __pycache__/
+
+# Monitoring script config (contains admin password / ingest key)
+scripts/config.json
 
 # Base de données SQLite (données de production — ne pas committer)
 backend/data/app.db

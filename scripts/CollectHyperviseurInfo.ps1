@@ -28,8 +28,8 @@ param(
     [string]$ESXiPass     = $env:ESXI_PASS,
 
     # Dashboard API
-    [string]$ApiUrl       = $env:API_URL    ?? "http://localhost:4000",
-    [string]$IngestKey    = $env:INGEST_KEY ?? "dev-ingest-key"
+    [string]$ApiUrl       = $(if ($env:API_URL) { $env:API_URL } else { "http://localhost:4000" }),
+    [string]$IngestKey    = $(if ($env:INGEST_KEY) { $env:INGEST_KEY } else { "dev-ingest-key" })
 )
 
 Set-StrictMode -Version Latest

@@ -81,7 +81,9 @@ const config = {
   dbPath: process.env.DB_PATH || './data/app.db',
   ingestKey: process.env.INGEST_KEY || 'dev-ingest-key',
   nodeEnv: process.env.NODE_ENV || 'development',
-  corsOrigin: process.env.CORS_ORIGIN || '*'
+  corsOrigin: process.env.CORS_ORIGIN || '*',
+  adminSeedPassword: process.env.ADMIN_SEED_PASSWORD || 'admin123',
+  userSeedPassword: process.env.USER_SEED_PASSWORD || 'user123'
 };
 
 logger.info('🚀 Configuration de développement chargée', {
@@ -89,6 +91,12 @@ logger.info('🚀 Configuration de développement chargée', {
   nodeEnv: config.nodeEnv,
   dbPath: config.dbPath
 });
+
+if (config.nodeEnv !== 'test') {
+  if (config.jwtSecret === 'devsecret-dev-only') logger.warn('JWT_SECRET is not set - using an insecure default. Set it via env var before deploying.');
+  if (config.ingestKey === 'dev-ingest-key') logger.warn('INGEST_KEY is not set - using an insecure default. Set it via env var before deploying.');
+  if (config.adminSeedPassword === 'admin123') logger.warn('ADMIN_SEED_PASSWORD is not set - the admin account will seed with a well-known default password. Set it via env var, or change the password afterwards via the Admin Panel.');
+}
 
 const upload = multer({ 
   storage: multer.memoryStorage(), 
@@ -294,6 +302,28 @@ CREATE INDEX IF NOT EXISTS idx_bandwidth_equipment ON bandwidth_data(equipment_i
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 
+CREATE TABLE IF NOT EXISTS hyperviseur_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  equipment_id INTEGER NOT NULL,
+  cpu_usage_pct REAL,
+  memory_usage_pct REAL,
+  vm_total INTEGER,
+  vm_running INTEGER,
+  collected_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_hyperviseur_metrics_equipment_time ON hyperviseur_metrics(equipment_id, collected_at);
+
+CREATE TABLE IF NOT EXISTS storage_metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  equipment_id INTEGER NOT NULL,
+  capacity_used_pct REAL,
+  capacity_total_tb REAL,
+  capacity_used_tb REAL,
+  disks_failed INTEGER,
+  collected_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_storage_metrics_equipment_time ON storage_metrics(equipment_id, collected_at);
+
 -- Equipment table ready
 `);
 
@@ -345,10 +375,10 @@ if (equipSchema && equipSchema.sql && equipSchema.sql.includes("'Camera','Switch
 // ---------- SEED ----------
 const userCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
 if (userCount === 0) {
-  const hash = bcrypt.hashSync('admin123', 10);
+  const hash = bcrypt.hashSync(config.adminSeedPassword, 10);
   db.prepare('INSERT INTO users (email,password_hash,role,name) VALUES (?,?,?,?)')
     .run('admin@semmaris.local', hash, 'Admin', 'Admin');
-  const uhash = bcrypt.hashSync('user123', 10);
+  const uhash = bcrypt.hashSync(config.userSeedPassword, 10);
   db.prepare('INSERT INTO users (email,password_hash,role,name) VALUES (?,?,?,?)')
     .run('user@semmaris.local', uhash, 'User', 'Utilisateur');
 }
@@ -1202,6 +1232,41 @@ app.get('/stats/overview', auth(['Admin','User','SGM']), (_req,res)=>{
   }
 });
 
+// GET /stats/history - tendances agrégées hyperviseurs/stockage sur une période
+app.get('/stats/history', auth(['Admin','User','SGM']), (req, res) => {
+  try {
+    const rawHours = parseInt(req.query.hours, 10);
+    const hours = Number.isFinite(rawHours) ? Math.min(Math.max(rawHours, 1), 720) : 24;
+
+    const hyperviseur = db.prepare(`
+      SELECT strftime('%Y-%m-%dT%H:00:00', collected_at) as bucket,
+             AVG(cpu_usage_pct) as avg_cpu_pct,
+             AVG(memory_usage_pct) as avg_ram_pct,
+             SUM(vm_total) as total_vms
+      FROM hyperviseur_metrics
+      WHERE collected_at >= datetime('now', '-' || ? || ' hours')
+      GROUP BY bucket
+      ORDER BY bucket ASC
+    `).all(hours);
+
+    const storage = db.prepare(`
+      SELECT strftime('%Y-%m-%dT%H:00:00', collected_at) as bucket,
+             AVG(capacity_used_pct) as avg_capacity_pct,
+             SUM(capacity_total_tb) as total_capacity_tb,
+             SUM(disks_failed) as total_failed_disks
+      FROM storage_metrics
+      WHERE collected_at >= datetime('now', '-' || ? || ' hours')
+      GROUP BY bucket
+      ORDER BY bucket ASC
+    `).all(hours);
+
+    res.json({ hyperviseur, storage });
+  } catch (e) {
+    console.error('GET /stats/history error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ---------- BANDWIDTH API ----------
 // GET /bandwidth - Récupérer les données de bande passante (24h par défaut)
 app.get('/bandwidth', auth(['Admin','User','SGM']), (req, res) => {
@@ -1697,10 +1762,7 @@ app.get('/metrics/switch/:id', auth(['Admin','User']), (req, res) => {
 app.get('/equipment', auth(['Admin','User','SGM']), (req, res) => {
   try {
     const type = req.query.type;
-    console.log(`[DEBUG] GET /equipment - type requested: "${type}"`);
-    console.log(`[DEBUG] ALLOWED_TYPES:`, ALLOWED_TYPES);
-    console.log(`[DEBUG] type && ALLOWED_TYPES.includes(type):`, type && ALLOWED_TYPES.includes(type));
-    
+
     const rawLimit = parseInt((req.query.limit ?? '').toString(), 10);
     const limitParam = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 200) : null;
 
@@ -1715,22 +1777,17 @@ app.get('/equipment', auth(['Admin','User','SGM']), (req, res) => {
       if (type && ALLOWED_TYPES.includes(type)) {
         sql += ' WHERE type = ?';
         params.push(type);
-        console.log(`[DEBUG] Adding WHERE clause for type: ${type}`);
       }
-      
+
       sql += ' ORDER BY id DESC';
-      
-      if (limitParam !== null) { 
-        sql += ' LIMIT ?'; 
-        params.push(limitParam); 
+
+      if (limitParam !== null) {
+        sql += ' LIMIT ?';
+        params.push(limitParam);
       }
-      
-      console.log(`[DEBUG] Final SQL: ${sql}`);
-      console.log(`[DEBUG] SQL params:`, params);
-      
+
       const rows = db.prepare(sql).all(...params);
-      console.log(`[DEBUG] Rows returned: ${rows.length}`);
-      
+
       // Pour les caméras et PCs, utiliser last_ping_at comme last_seen si disponible
       const enhancedRows = rows.map(row => {
         const result = {
@@ -1839,6 +1896,9 @@ app.post('/ingest/hyperviseur', requireIngestKey, (req, res) => {
       last_info_at=datetime('now'), info_json=?, name=?, model=?, updated_at=datetime('now')
       WHERE id=?`).run(pingStatus, JSON.stringify(info), resolvedName, model || 'VMware ESXi', row.id);
 
+    db.prepare(`INSERT INTO hyperviseur_metrics (equipment_id, cpu_usage_pct, memory_usage_pct, vm_total, vm_running)
+      VALUES (?,?,?,?,?)`).run(row.id, info.cpu_usage_pct, info.memory_usage_pct, info.vm_total, info.vm_running);
+
     res.json({ ok: true, equipment_id: row.id });
   } catch (e) {
     console.error('POST /ingest/hyperviseur error:', e);
@@ -1902,6 +1962,9 @@ app.post('/ingest/storage', requireIngestKey, (req, res) => {
       last_info_at=datetime('now'), info_json=?, name=?, model=?, updated_at=datetime('now')
       WHERE id=?`).run(pingStatus, JSON.stringify(info), resolvedName, model || 'Seagate Exos X 5U84', row.id);
 
+    db.prepare(`INSERT INTO storage_metrics (equipment_id, capacity_used_pct, capacity_total_tb, capacity_used_tb, disks_failed)
+      VALUES (?,?,?,?,?)`).run(row.id, info.capacity_used_pct, info.capacity_total_tb, info.capacity_used_tb, info.disks_failed);
+
     res.json({ ok: true, equipment_id: row.id });
   } catch (e) {
     console.error('POST /ingest/storage error:', e);
@@ -1933,6 +1996,30 @@ app.get('/metrics/hyperviseur/:id', auth(['Admin', 'User']), (req, res) => {
   }
 });
 
+app.get('/metrics/hyperviseur/:id/history', auth(['Admin', 'User']), (req, res) => {
+  try {
+    const equipment = db.prepare('SELECT id FROM equipment WHERE id = ? AND type = ?')
+      .get(req.params.id, 'Hyperviseur');
+    if (!equipment) return res.status(404).json({ error: 'Hyperviseur not found' });
+
+    const rawHours = parseInt(req.query.hours, 10);
+    const hours = Number.isFinite(rawHours) ? Math.min(Math.max(rawHours, 1), 720) : 24;
+
+    const rows = db.prepare(`
+      SELECT cpu_usage_pct, memory_usage_pct, vm_total, vm_running, collected_at
+      FROM hyperviseur_metrics
+      WHERE equipment_id = ? AND collected_at >= datetime('now', '-' || ? || ' hours')
+      ORDER BY collected_at ASC
+      LIMIT 2000
+    `).all(equipment.id, hours);
+
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /metrics/hyperviseur/:id/history error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ---------- MÉTRIQUES STOCKAGE ----------
 app.get('/metrics/storage/:id', auth(['Admin', 'User']), (req, res) => {
   try {
@@ -1953,6 +2040,30 @@ app.get('/metrics/storage/:id', auth(['Admin', 'User']), (req, res) => {
     });
   } catch (e) {
     console.error('GET /metrics/storage/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.get('/metrics/storage/:id/history', auth(['Admin', 'User']), (req, res) => {
+  try {
+    const equipment = db.prepare('SELECT id FROM equipment WHERE id = ? AND type = ?')
+      .get(req.params.id, 'Stockage');
+    if (!equipment) return res.status(404).json({ error: 'Stockage not found' });
+
+    const rawHours = parseInt(req.query.hours, 10);
+    const hours = Number.isFinite(rawHours) ? Math.min(Math.max(rawHours, 1), 720) : 24;
+
+    const rows = db.prepare(`
+      SELECT capacity_used_pct, capacity_total_tb, capacity_used_tb, disks_failed, collected_at
+      FROM storage_metrics
+      WHERE equipment_id = ? AND collected_at >= datetime('now', '-' || ? || ' hours')
+      ORDER BY collected_at ASC
+      LIMIT 2000
+    `).all(equipment.id, hours);
+
+    res.json(rows);
+  } catch (e) {
+    console.error('GET /metrics/storage/:id/history error:', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
