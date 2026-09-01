@@ -7,7 +7,7 @@ $ErrorActionPreference = "Continue"
 $configPath = Join-Path $PSScriptRoot "config.json"
 $config = Get-Content $configPath | ConvertFrom-Json
 
-$apiBase = $config.apiBase
+$apiBase = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
 $adminEmail = $config.adminEmail
 $adminPassword = $config.adminPassword
 $ingestKey = $config.ingestKey
@@ -62,39 +62,41 @@ function Get-Equipment {
 
 function Test-Ping {
     param([string]$ip)
-    
+
     # Nettoyer l'IP (enlever le port si present)
     $cleanIp = $ip -replace ':\d+$', ''
-    
+
+    # Utilise Test-Connection (cross-platform : fonctionne en Windows PowerShell 5.1
+    # ET en PowerShell 7/pwsh sous Linux - contrairement a l'appel a "ping" qui a des
+    # options incompatibles entre Windows (-n/-w) et Linux (-c/-W)).
     # Tenter 3 fois avant de declarer DOWN
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
-            $result = ping $cleanIp -n 1 -w 1000 | Out-String
-            
-            if ($result -match "TTL=") {
-                # Extraire la latence
-                if ($result -match "time[=<](\d+)ms") {
-                    return @{
-                        status = "UP"
-                        latency = [int]$matches[1]
-                    }
+            $reply = Test-Connection -ComputerName $cleanIp -Count 1 -ErrorAction Stop
+            if ($reply) {
+                $r = $reply | Select-Object -First 1
+                $latency = 0
+                if ($r.PSObject.Properties.Name -contains 'Latency' -and $null -ne $r.Latency) {
+                    $latency = [int]$r.Latency
+                } elseif ($r.PSObject.Properties.Name -contains 'ResponseTime' -and $null -ne $r.ResponseTime) {
+                    $latency = [int]$r.ResponseTime
                 }
                 return @{
                     status = "UP"
-                    latency = 0
+                    latency = $latency
                 }
             }
         }
         catch {
             # Continuer vers la prochaine tentative
         }
-        
+
         # Si ce n'est pas la derniere tentative, attendre 500ms avant de reessayer
         if ($attempt -lt 3) {
             Start-Sleep -Milliseconds 500
         }
     }
-    
+
     # Les 3 tentatives ont echoue
     return @{
         status = "DOWN"

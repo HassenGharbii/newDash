@@ -21,22 +21,28 @@ if (-not (Test-Path $ConfigFile)) {
 }
 
 $config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
-$apiBase = $config.apiBase
+$apiBase = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
 $ingestKey = $config.ingestKey
 
-# Chemin vers SnmpWalk.exe (défini tôt pour les vérifications)
-$snmpWalkPath = "C:\Users\Axone\Documents\SnmpWalk\SnmpWalk.exe"
+# Outil SNMP : net-snmp (snmpget/snmpwalk, multiplateforme) en priorite, sinon SnmpWalk.exe (Windows uniquement)
+$snmpWalkPath = Join-Path $scriptPath "SnmpWalk\SnmpWalk.exe"
+$SNMP_TOOL = $null
+if (Get-Command snmpget -ErrorAction SilentlyContinue) {
+    $SNMP_TOOL = "netsnmp"
+} elseif (Test-Path $snmpWalkPath) {
+    $SNMP_TOOL = "snmpwalkexe"
+}
+$snmpAvailable = [bool]$SNMP_TOOL
 
 Write-Host "===============================================" -ForegroundColor Cyan
 Write-Host "   Collecte SNMP Switches - Métriques Complètes" -ForegroundColor Cyan
 Write-Host "===============================================" -ForegroundColor Cyan
 Write-Host "[CONFIG] API: $apiBase" -ForegroundColor Gray
 Write-Host "[CONFIG] Community SNMP: $SnmpCommunity" -ForegroundColor Gray
-Write-Host "[CONFIG] SnmpWalk: $snmpWalkPath" -ForegroundColor Gray
+Write-Host "[CONFIG] Outil SNMP: $(if ($SNMP_TOOL -eq 'netsnmp') { 'net-snmp (snmpget/snmpwalk)' } elseif ($SNMP_TOOL -eq 'snmpwalkexe') { "SnmpWalk.exe ($snmpWalkPath)" } else { 'aucun' })" -ForegroundColor Gray
 
-# Verifier que SnmpWalk.exe existe
-if (-not (Test-Path $snmpWalkPath)) {
-    Write-Warning "SnmpWalk.exe introuvable: $snmpWalkPath"
+if (-not $snmpAvailable) {
+    Write-Warning "Aucun outil SNMP disponible (ni snmpget/net-snmp, ni SnmpWalk.exe)"
     Write-Host "Sans SNMP, seules des donnees basiques (ping) seront collectees." -ForegroundColor Yellow
 }
 
@@ -70,11 +76,19 @@ function Invoke-SnmpGet {
         [string]$Community,
         [string]$Oid
     )
-    
+
     try {
+        if ($SNMP_TOOL -eq "netsnmp") {
+            $result = snmpget -v2c -c $Community -t 2 -r 1 -Oqv $IpAddress $Oid 2>$null
+            if ($result) {
+                return ($result | Select-Object -First 1).ToString().Trim().Trim('"')
+            }
+            return $null
+        }
+
         # Utiliser SnmpWalk.exe avec les parametres adaptes
         $result = & $snmpWalkPath -v:2c -c:$Community -r:$IpAddress -os:$Oid 2>$null
-        
+
         if ($LASTEXITCODE -eq 0 -and $result) {
             # Parser la sortie (format: ".OID, Type=XXX, Value=YYY")
             $lines = $result -split "`n"
@@ -98,11 +112,19 @@ function Invoke-SnmpWalk {
         [string]$Community,
         [string]$Oid
     )
-    
+
     try {
+        if ($SNMP_TOOL -eq "netsnmp") {
+            $result = snmpwalk -v2c -c $Community -t 2 -r 1 -Oqv $IpAddress $Oid 2>$null
+            if ($result) {
+                return @($result | ForEach-Object { $_.ToString().Trim().Trim('"') })
+            }
+            return @()
+        }
+
         # Utiliser SnmpWalk.exe pour recuperer une table
         $result = & $snmpWalkPath -v:2c -c:$Community -r:$IpAddress -os:$Oid 2>$null
-        
+
         if ($LASTEXITCODE -eq 0 -and $result) {
             # Parser chaque ligne et extraire les valeurs après "Value="
             $values = @()
@@ -162,12 +184,9 @@ function Get-SwitchMetrics {
     )
     
     Write-Host "  -> Collecte SNMP de $IpAddress..." -ForegroundColor Gray
-    
-    # Verifier si SnmpWalk est disponible
-    $snmpAvailable = Test-Path $snmpWalkPath
-    
+
     if (-not $snmpAvailable) {
-        Write-Host "    [WARN] SnmpWalk non disponible - collecte basique uniquement" -ForegroundColor Yellow
+        Write-Host "    [WARN] Aucun outil SNMP disponible - collecte basique uniquement" -ForegroundColor Yellow
         return Get-SnmpDataNative -IpAddress $IpAddress -Community $Community
     }
     
@@ -501,9 +520,8 @@ Write-Host "Succès: $successCount" -ForegroundColor Green
 Write-Host "Échecs: $failCount" -ForegroundColor $(if ($failCount -gt 0) { "Red" } else { "Gray" })
 Write-Host ""
 
-if (-not (Test-Path $snmpWalkPath)) {
-    Write-Host "[IMPORTANT] SnmpWalk.exe n'est pas installe ou introuvable!" -ForegroundColor Yellow
-    Write-Host "Chemin attendu: $snmpWalkPath" -ForegroundColor Yellow
+if (-not $snmpAvailable) {
+    Write-Host "[IMPORTANT] Aucun outil SNMP disponible (ni snmpget/net-snmp, ni SnmpWalk.exe)!" -ForegroundColor Yellow
     Write-Host "Sans SNMP, seules des donnees basiques (ping) seront collectees." -ForegroundColor Yellow
     Write-Host ""
 }

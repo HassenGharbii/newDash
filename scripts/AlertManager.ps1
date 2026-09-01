@@ -35,7 +35,7 @@ if (-not (Test-Path $ConfigPath)) {
 }
 $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 
-$apiBase             = $config.apiBase
+$apiBase             = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
 $adminEmail          = $config.adminEmail
 $adminPassword       = $config.adminPassword
 $pollIntervalSeconds = if ($config.pollIntervalSeconds -gt 0) { $config.pollIntervalSeconds } else { 60 }

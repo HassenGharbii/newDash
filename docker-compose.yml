@@ -24,11 +24,7 @@ services:
       - "3001:5173"
     depends_on:
       - api
-  # NOTE: this container still won't fully work as-is - CollectSwitchBandwidth.ps1
-  # shells out to SnmpWalk.exe, a native Windows binary, which cannot run inside
-  # this Linux-based powershell image regardless of the script path. Either run
-  # bandwidth collection on the Windows monitoring host (StartAllMonitors.ps1)
-  # instead of via Docker, or port the script to a Linux SNMP client.
+
   ping-monitor:
     build:
       context: .
@@ -39,6 +35,8 @@ services:
     environment:
       - API_URL=http://api:4000
       - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+    cap_add:
+      - NET_RAW   # ICMP ping needs raw sockets; usually included by default but added defensively
     depends_on:
       - api
     restart: always
@@ -53,6 +51,63 @@ services:
     environment:
       - API_URL=http://api:4000
       - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+    cap_add:
+      - NET_RAW
     depends_on:
       - api
     restart: always
+
+  switch-metrics-monitor:
+    build:
+      context: .
+      dockerfile: docker/monitor/Dockerfile
+    image: semmaris/monitors:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/CollectSwitchMetrics.ps1
+    environment:
+      - API_URL=http://api:4000
+      - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - api
+    restart: always
+
+  alert-manager:
+    build:
+      context: .
+      dockerfile: docker/monitor/Dockerfile
+    image: semmaris/monitors:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/AlertManager.ps1
+    environment:
+      - API_URL=http://api:4000
+    depends_on:
+      - api
+    restart: always
+
+  backup:
+    build:
+      context: .
+      dockerfile: docker/monitor/Dockerfile
+    image: semmaris/monitors:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/BackupLoop.ps1
+    volumes:
+      - ./backend/data:/data
+    depends_on:
+      - api
+    restart: always
+
+# NOT containerized here, on purpose:
+#
+# - CollectServerMetricsV2.ps1 (physical/VM server metrics): its "local" collection path uses
+#   Windows-only CIM/WMI classes and perf counters that don't exist on Linux, and its "remote"
+#   path talks to other Windows servers over WinRM with a credential prompt. It's architecturally
+#   meant to run on/against Windows hosts, not as a generic Linux container. Keep running it via
+#   scripts/StartAllMonitors.ps1 (or a Scheduled Task) on a Windows host.
+#
+# - CollectHyperviseurInfo.ps1 / CollectStorageInfo.ps1 (VMware/Seagate collectors): need real
+#   vCenter/ESXi/Seagate credentials that aren't configured yet, and VMware.PowerCLI is a large
+#   module to bake into this image for no benefit until those credentials exist. Run these
+#   manually or via a separate Scheduled Task once real infrastructure access is available.

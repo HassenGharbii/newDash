@@ -13,14 +13,21 @@ if (-not (Test-Path $CONFIG_FILE)) {
     exit 1
 }
 
-if (-not (Test-Path $SNMPWALK_PATH)) {
-    Write-Error "SnmpWalk.exe introuvable a l'emplacement attendu: $SNMPWALK_PATH"
+# Outil SNMP disponible : net-snmp (snmpget, multiplateforme - installe via apt sous Linux,
+# ou via Install-NetSNMP*.ps1 sous Windows) en priorite, sinon SnmpWalk.exe (Windows uniquement).
+$SNMP_TOOL = $null
+if (Get-Command snmpget -ErrorAction SilentlyContinue) {
+    $SNMP_TOOL = "netsnmp"
+} elseif (Test-Path $SNMPWALK_PATH) {
+    $SNMP_TOOL = "snmpwalkexe"
+} else {
+    Write-Error "Aucun outil SNMP disponible (ni snmpget/net-snmp dans le PATH, ni SnmpWalk.exe a $SNMPWALK_PATH)"
     exit 1
 }
 
 $config = Get-Content $CONFIG_FILE -Raw | ConvertFrom-Json
-$API_URL = $config.apiBase
-$API_KEY = $config.ingestKey
+$API_URL = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
+$API_KEY = if ($env:INGEST_KEY) { $env:INGEST_KEY } else { $config.ingestKey }
 $SNMP_COMMUNITY = "public"
 
 # Liste des switches a monitorer - vient de config.json (champ "switches"), plus de liste en dur ici
@@ -43,14 +50,23 @@ Write-Host "========================================"
 Write-Host "`nAPI: $API_URL"
 Write-Host "Switches: $($SWITCHES.Count)"
 Write-Host "Intervalle: $IntervalSeconds secondes"
-Write-Host "Methode: SnmpWalk avec OID precis (rapide)"
+Write-Host "Outil SNMP: $(if ($SNMP_TOOL -eq 'netsnmp') { 'net-snmp (snmpget)' } else { 'SnmpWalk.exe' })"
 Write-Host "`nDemarrage...`n"
 
-# Fonction SNMP Walk sur un OID précis (équivalent à GET)
+# Fonction SNMP Get sur un OID précis
 function Get-SnmpValue {
     param([string]$IP, [string]$OID)
-    
+
     try {
+        if ($SNMP_TOOL -eq "netsnmp") {
+            $output = snmpget -v2c -c $SNMP_COMMUNITY -t 2 -r 1 -Oqv $IP $OID 2>$null | Select-Object -First 1
+            if ($output) {
+                $val = $output.ToString().Trim().Trim('"')
+                if ($val -match '^\d+$') { return [int64]$val }
+            }
+            return $null
+        }
+
         $output = & $SNMPWALK_PATH -r:$IP -c:$SNMP_COMMUNITY -os:$OID -csv 2>$null | Select-Object -First 1
         if ($output -and $output -match ',(\d+)') {
             return [int64]$matches[1]
