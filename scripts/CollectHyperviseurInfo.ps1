@@ -8,12 +8,20 @@
     Récupère : CPU/RAM, VMs (état), datastores, uptime, version ESXi.
     Envoie les données vers POST /ingest/hyperviseur.
 
+    Deux modes :
+    - Ponctuel (par défaut si -VCenterHost/-ESXiHosts sont fournis) : une seule collecte puis sortie.
+    - Continu (-Loop, ou automatique si aucune cible n'est fournie en ligne de commande) :
+      récupère la configuration de connexion depuis l'API (Panel Admin > Intégrations,
+      GET /integrations/vmware/config) à chaque cycle, et collecte en boucle. C'est le mode
+      utilisé par le conteneur Docker.
+
 .PREREQUISIS
     Install-Module -Name VMware.PowerCLI -Scope CurrentUser
 
 .EXEMPLE
     .\CollectHyperviseurInfo.ps1 -VCenterHost "vcenter.semmaris.local" -VCenterUser "administrator@vsphere.local"
     .\CollectHyperviseurInfo.ps1 -ESXiHosts @("192.168.1.10","192.168.1.11") -ESXiUser "root"
+    .\CollectHyperviseurInfo.ps1 -Loop -IntervalSeconds 300
 #>
 
 param(
@@ -29,11 +37,18 @@ param(
 
     # Dashboard API
     [string]$ApiUrl       = $(if ($env:API_URL) { $env:API_URL } else { "http://localhost:4000" }),
-    [string]$IngestKey    = $(if ($env:INGEST_KEY) { $env:INGEST_KEY } else { "dev-ingest-key" })
+    [string]$IngestKey    = $(if ($env:INGEST_KEY) { $env:INGEST_KEY } else { "dev-ingest-key" }),
+
+    # Mode continu (recupere la config depuis l'API a chaque cycle)
+    [switch]$Loop,
+    [int]$IntervalSeconds = 300
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Deliberately no Set-StrictMode here: PowerCLI's View/Summary objects carry a different
+# property set depending on connection mode (vCenter vs direct ESXi) and PowerCLI version -
+# under strict mode a merely-absent field (e.g. VendorIdentifier on some direct-ESXi
+# connections) throws instead of returning $null, aborting the whole host's collection.
 
 # ─── Logging ────────────────────────────────────────────────────────────────
 function Write-Log {
@@ -52,6 +67,20 @@ if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
 Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
 Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope User | Out-Null
 Set-PowerCLIConfiguration -ParticipateInCeip $false -Confirm:$false -Scope User 2>$null | Out-Null
+
+# ─── Récupération de TOUTES les connexions VMware configurées (mode continu) ────
+# Plusieurs connexions nommées peuvent être configurées (Panel Admin > Intégrations) -
+# chacune est collectée séparément et taguée avec son nom (connection_name) pour que le
+# frontend puisse filtrer par connexion.
+function Get-RemoteVCenterConnections {
+    try {
+        $headers = @{ "x-ingest-key" = $IngestKey }
+        return @(Invoke-RestMethod -Uri "$ApiUrl/integrations/vmware/connections/config" -Method GET -Headers $headers -TimeoutSec 15)
+    } catch {
+        Write-Log "WARN" "Impossible de récupérer les connexions VMware depuis l'API: $($_.Exception.Message)"
+        return @()
+    }
+}
 
 # ─── Envoi vers l'API ───────────────────────────────────────────────────────
 function Send-HyperviseurData {
@@ -74,7 +103,7 @@ function Send-HyperviseurData {
 
 # ─── Collecte depuis un VMHost ───────────────────────────────────────────────
 function Collect-VMHost {
-    param($VMHost)
+    param($VMHost, $ViConnection, [bool]$DirectEsxi = $false, [string]$ConnectionName = '')
 
     try {
         $hostView = $VMHost | Get-View
@@ -93,15 +122,41 @@ function Collect-VMHost {
         $memUsagePct  = if ($memTotalMB -gt 0) { [math]::Round(($memUsedMB / $memTotalMB) * 100, 1) } else { 0 }
 
         # VMs
-        $vms = Get-VM -Server $global:viConn -VMHost $VMHost -ErrorAction SilentlyContinue
-        $vmRunning   = ($vms | Where-Object { $_.PowerState -eq "PoweredOn" }).Count
-        $vmStopped   = ($vms | Where-Object { $_.PowerState -eq "PoweredOff" }).Count
-        $vmSuspended = ($vms | Where-Object { $_.PowerState -eq "Suspended" }).Count
+        # Note : -Location $VMHost ne retourne rien de fiable sur une connexion ESXi directe
+        # (pas de vCenter) avec cette version de PowerCLI - dans ce cas, la connexion ne
+        # concerne de toute facon qu'un seul hote, donc on recupere tout sans filtrer.
+        if ($DirectEsxi) {
+            $vms = @(Get-VM -Server $ViConnection -ErrorAction SilentlyContinue)
+        } else {
+            $vms = @(Get-VM -Server $ViConnection -Location $VMHost -ErrorAction SilentlyContinue)
+        }
+        $vmRunning   = @($vms | Where-Object { $_.PowerState -eq "PoweredOn" }).Count
+        $vmStopped   = @($vms | Where-Object { $_.PowerState -eq "PoweredOff" }).Count
+        $vmSuspended = @($vms | Where-Object { $_.PowerState -eq "Suspended" }).Count
         $vmTotal     = $vms.Count
 
+        # Détail par VM (nom, état, ressources, OS/IP si VMware Tools est installé)
+        $vmDetails = @()
+        foreach ($vm in $vms) {
+            $vmDetails += @{
+                name         = $vm.Name
+                power_state  = $vm.PowerState.ToString()
+                cpu_count    = $vm.NumCpu
+                memory_gb    = [math]::Round($vm.MemoryGB, 1)
+                provisioned_space_gb = [math]::Round($vm.ProvisionedSpaceGB, 1)
+                used_space_gb = [math]::Round($vm.UsedSpaceGB, 1)
+                guest_os     = if ($vm.Guest -and $vm.Guest.OSFullName) { $vm.Guest.OSFullName } else { $vm.ExtensionData.Config.GuestFullName }
+                ip_address   = if ($vm.Guest -and $vm.Guest.IPAddress) { ($vm.Guest.IPAddress | Select-Object -First 1) } else { $null }
+            }
+        }
+
         # Datastores
+        # Note : -Location de Get-Datastore n'accepte pas d'objet VMHost dans cette version
+        # de PowerCLI ("accepts only Datacenter, Folder and DatastoreCluster objects") - il
+        # faut passer le VMHost par le pipeline pour un scoping correct par hote.
         $datastores = @()
-        Get-Datastore -VMHost $VMHost -ErrorAction SilentlyContinue | ForEach-Object {
+        $dsList = $VMHost | Get-Datastore -Server $ViConnection -ErrorAction SilentlyContinue
+        $dsList | ForEach-Object {
             $ds = $_
             $datastores += @{
                 name        = $ds.Name
@@ -134,12 +189,14 @@ function Collect-VMHost {
             vm_running      = $vmRunning
             vm_stopped      = $vmStopped
             vm_suspended    = $vmSuspended
+            vms             = $vmDetails
             uptime_days     = $uptimeDays
             cpu_sockets     = $hardware.NumCpuPkgs
             cpu_cores_total = $hardware.NumCpuCores
             cpu_mhz         = $hardware.CpuMhz
             datastores      = $datastores
             status          = $status
+            connection_name = $ConnectionName
         }
 
         Write-Log "INFO" "Collecté : $($VMHost.Name) | CPU: $cpuUsagePct% | RAM: $memUsagePct% | VMs: $vmRunning/$vmTotal actives"
@@ -150,9 +207,115 @@ function Collect-VMHost {
 
         # Envoyer au moins le statut DOWN
         Send-HyperviseurData -Data @{
-            hostname = $VMHost.Name
-            ip       = $VMHost.Name
-            status   = "disconnected"
+            hostname        = $VMHost.Name
+            ip              = $VMHost.Name
+            status          = "disconnected"
+            connection_name = $ConnectionName
+        }
+    }
+}
+
+# Retient, par connexion, les derniers hotes ESXi vus sous un vCenter - permet de signaler
+# ces hotes comme DOWN si une connexion ulterieure au vCenter echoue completement (sinon on
+# ne saurait pas quels hotes existaient pour les marquer hors ligne).
+$script:lastKnownHostsByConnection = @{}
+
+# ─── Un cycle complet de collecte (vCenter ou ESXi direct) ──────────────────
+function Invoke-VMwareCollection {
+    param(
+        [string]$VCenterHost, [string]$VCenterUser, [string]$VCenterPass,
+        [string[]]$ESXiHosts, [string]$ESXiUser, [string]$ESXiPass,
+        [bool]$AllowPrompt = $false, [string]$ConnectionName = ''
+    )
+
+    $viConn = $null
+    try {
+        if ($VCenterHost) {
+            Write-Log "INFO" "Connexion à vCenter: $VCenterHost"
+
+            if (-not $VCenterPass -and $AllowPrompt) {
+                $secPass = Read-Host "Mot de passe vCenter" -AsSecureString
+                $VCenterPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass))
+            }
+            if (-not $VCenterPass) {
+                Write-Log "WARN" "Aucun mot de passe vCenter fourni - collecte ignorée pour ce cycle."
+                return
+            }
+
+            try {
+                $viConn = Connect-VIServer -Server $VCenterHost -User $VCenterUser -Password $VCenterPass -ErrorAction Stop
+            } catch {
+                Write-Log "WARN" "Impossible de se connecter à vCenter $VCenterHost : $($_.Exception.Message)"
+                # On ne peut pas interroger les hotes maintenant qu'on est deconnecte - on
+                # utilise la derniere liste connue pour signaler ces hotes comme hors ligne
+                # au lieu de laisser leur statut UP en base indéfiniment.
+                $known = $script:lastKnownHostsByConnection[$ConnectionName]
+                if ($known) {
+                    foreach ($hostName in $known) {
+                        Send-HyperviseurData -Data @{
+                            hostname        = $hostName
+                            ip              = $hostName
+                            status          = "disconnected"
+                            connection_name = $ConnectionName
+                        }
+                    }
+                }
+                return
+            }
+            Write-Log "INFO" "✅ Connecté à vCenter $VCenterHost"
+
+            $vmHosts = @(Get-VMHost -Server $viConn)
+            Write-Log "INFO" "Hosts ESXi trouvés : $($vmHosts.Count)"
+            $script:lastKnownHostsByConnection[$ConnectionName] = @($vmHosts | ForEach-Object { $_.Name })
+
+            foreach ($h in $vmHosts) {
+                Collect-VMHost -VMHost $h -ViConnection $viConn -ConnectionName $ConnectionName
+            }
+
+        } elseif ($ESXiHosts -and $ESXiHosts.Count -gt 0) {
+            foreach ($esxiIp in $ESXiHosts) {
+                Write-Log "INFO" "Connexion directe à ESXi: $esxiIp"
+                $hostPass = $ESXiPass
+                try {
+                    if (-not $hostPass -and $AllowPrompt) {
+                        $secPass = Read-Host "Mot de passe ESXi $esxiIp" -AsSecureString
+                        $hostPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass))
+                    }
+                    if (-not $hostPass) {
+                        Write-Log "WARN" "Aucun mot de passe ESXi fourni pour $esxiIp - ignoré."
+                        continue
+                    }
+
+                    $esxiConn = Connect-VIServer -Server $esxiIp -User $ESXiUser -Password $hostPass -ErrorAction Stop
+                    Write-Log "INFO" "✅ Connecté à $esxiIp"
+
+                    $vmHost = Get-VMHost -Server $esxiConn | Select-Object -First 1
+                    Collect-VMHost -VMHost $vmHost -ViConnection $esxiConn -DirectEsxi $true -ConnectionName $ConnectionName
+
+                    Disconnect-VIServer -Server $esxiConn -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {
+                    Write-Log "WARN" "Impossible de se connecter à $esxiIp : $($_.Exception.Message)"
+                    # Signaler l'hote comme hors ligne plutot que de laisser son statut UP
+                    # en base indefiniment jusqu'a la prochaine connexion reussie.
+                    Send-HyperviseurData -Data @{
+                        hostname        = $esxiIp
+                        ip              = $esxiIp
+                        status          = "disconnected"
+                        connection_name = $ConnectionName
+                    }
+                }
+            }
+        } else {
+            Write-Log "WARN" "Aucune cible VMware configurée."
+        }
+    } catch {
+        Write-Log "WARN" "Erreur de collecte VMware : $($_.Exception.Message)"
+    } finally {
+        if ($viConn) {
+            Disconnect-VIServer -Server $viConn -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Log "INFO" "Déconnecté de vCenter/ESXi"
         }
     }
 }
@@ -160,65 +323,63 @@ function Collect-VMHost {
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 Write-Log "INFO" "═══════ Collecte Hyperviseurs VMware ═══════"
 
-$global:viConn = $null
+$hasExplicitTarget = [bool]$VCenterHost -or ($ESXiHosts -and $ESXiHosts.Count -gt 0)
 
-try {
-    # Connexion vCenter ou ESXi direct
-    if ($VCenterHost) {
-        Write-Log "INFO" "Connexion à vCenter: $VCenterHost"
-
-        if (-not $VCenterPass) {
-            $secPass = Read-Host "Mot de passe vCenter" -AsSecureString
-            $VCenterPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass))
-        }
-
-        $global:viConn = Connect-VIServer -Server $VCenterHost `
-            -User $VCenterUser -Password $VCenterPass -ErrorAction Stop
-        Write-Log "INFO" "✅ Connecté à vCenter $VCenterHost"
-
-        $vmHosts = Get-VMHost -Server $global:viConn
-        Write-Log "INFO" "Hosts ESXi trouvés : $($vmHosts.Count)"
-
-        foreach ($h in $vmHosts) {
-            Collect-VMHost -VMHost $h
-        }
-
-    } elseif ($ESXiHosts.Count -gt 0) {
-        # Mode connexion directe à chaque ESXi
-        foreach ($esxiIp in $ESXiHosts) {
-            Write-Log "INFO" "Connexion directe à ESXi: $esxiIp"
-            try {
-                if (-not $ESXiPass) {
-                    $secPass = Read-Host "Mot de passe ESXi $esxiIp" -AsSecureString
-                    $ESXiPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass))
-                }
-
-                $global:viConn = Connect-VIServer -Server $esxiIp `
-                    -User $ESXiUser -Password $ESXiPass -ErrorAction Stop
-                Write-Log "INFO" "✅ Connecté à $esxiIp"
-
-                $vmHost = Get-VMHost -Server $global:viConn | Select-Object -First 1
-                Collect-VMHost -VMHost $vmHost
-
-                Disconnect-VIServer -Server $global:viConn -Confirm:$false -ErrorAction SilentlyContinue
-                $global:viConn = $null
-            } catch {
-                Write-Log "WARN" "Impossible de se connecter à $esxiIp : $($_.Exception.Message)"
-            }
+if ($Loop -or -not $hasExplicitTarget) {
+    if ($hasExplicitTarget) {
+        Write-Log "INFO" "Mode continu (cible fixe) - collecte toutes les ${IntervalSeconds}s"
+        while ($true) {
+            Invoke-VMwareCollection -VCenterHost $VCenterHost -VCenterUser $VCenterUser -VCenterPass $VCenterPass `
+                -ESXiHosts $ESXiHosts -ESXiUser $ESXiUser -ESXiPass $ESXiPass -AllowPrompt $false -ConnectionName "CLI"
+            Start-Sleep -Seconds $IntervalSeconds
         }
     } else {
-        Write-Log "ERROR" "Aucune cible définie. Utilisez -VCenterHost ou -ESXiHosts."
-        Write-Log "INFO"  "Exemple: .\CollectHyperviseurInfo.ps1 -VCenterHost vcenter.semmaris.local -VCenterUser administrator@vsphere.local"
-        exit 1
-    }
+        # Chaque connexion a son propre planning : collecte reguliere toutes les
+        # IntervalSeconds, MAIS on verifie toutes les PollTickSeconds si le bouton
+        # "Collecter maintenant" (Panel Admin > Integrations) a ete utilise, pour
+        # reagir en quelques secondes plutot que d'attendre le cycle complet.
+        $PollTickSeconds = 10
+        $lastCollectedAt = @{}
+        $lastTriggerSeen = @{}
+        $lastEmptyLogAt = $null
 
-} finally {
-    if ($global:viConn) {
-        Disconnect-VIServer -Server $global:viConn -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Log "INFO" "Déconnecté de vCenter/ESXi"
+        Write-Log "INFO" "Mode continu - connexions depuis l'API (Panel Admin > Intégrations), verifiees toutes les ${PollTickSeconds}s, collecte reguliere toutes les ${IntervalSeconds}s par connexion"
+
+        while ($true) {
+            $connections = Get-RemoteVCenterConnections
+            $usable = @($connections | Where-Object { $_.vcenterHost -or ($_.esxiHosts -and $_.esxiHosts.Count -gt 0) })
+
+            foreach ($conn in $usable) {
+                $key = "$($conn.id)"
+                $now = Get-Date
+
+                $dueRegular = -not $lastCollectedAt.ContainsKey($key) -or (($now - $lastCollectedAt[$key]).TotalSeconds -ge $IntervalSeconds)
+                $dueTrigger = $conn.triggerRequestedAt -and ($lastTriggerSeen[$key] -ne $conn.triggerRequestedAt)
+
+                if ($dueRegular -or $dueTrigger) {
+                    if ($dueTrigger -and -not $dueRegular) {
+                        Write-Log "INFO" "─── Connexion: $($conn.name) (collecte demandée manuellement) ───"
+                    } else {
+                        Write-Log "INFO" "─── Connexion: $($conn.name) ───"
+                    }
+                    Invoke-VMwareCollection -VCenterHost $conn.vcenterHost -VCenterUser $conn.vcenterUser -VCenterPass $conn.vcenterPass `
+                        -ESXiHosts $conn.esxiHosts -ESXiUser $conn.esxiUser -ESXiPass $conn.esxiPass -AllowPrompt $false -ConnectionName $conn.name
+                    $lastCollectedAt[$key] = $now
+                    $lastTriggerSeen[$key] = $conn.triggerRequestedAt
+                }
+            }
+
+            if ($usable.Count -eq 0 -and (-not $lastEmptyLogAt -or ((Get-Date) - $lastEmptyLogAt).TotalSeconds -ge $IntervalSeconds)) {
+                Write-Log "INFO" "Aucune connexion VMware configurée (Panel Admin > Intégrations)."
+                $lastEmptyLogAt = Get-Date
+            }
+
+            Start-Sleep -Seconds $PollTickSeconds
+        }
     }
+} else {
+    Invoke-VMwareCollection -VCenterHost $VCenterHost -VCenterUser $VCenterUser -VCenterPass $VCenterPass `
+        -ESXiHosts $ESXiHosts -ESXiUser $ESXiUser -ESXiPass $ESXiPass -AllowPrompt $true -ConnectionName "CLI"
 }
 
 Write-Log "INFO" "═══════ Collecte terminée ═══════"

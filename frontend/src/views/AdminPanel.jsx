@@ -161,11 +161,12 @@ export default function AdminPanel(){
           <div style={ui.tabs}>
             <button style={ui.tab(tab==='equip')} onClick={()=>setTab('equip')}>Équipements</button>
             <button style={ui.tab(tab==='users')} onClick={()=>setTab('users')}>Utilisateurs & Rôles</button>
+            <button style={ui.tab(tab==='integrations')} onClick={()=>setTab('integrations')}>Intégrations</button>
           </div>
         </div>
 
         <div className="bg-black/10 backdrop-blur-sm rounded-xl border border-red-800/20 p-6">
-          {tab==='equip' ? <EquipmentsAdmin/> : <UsersAdmin/>}
+          {tab==='equip' ? <EquipmentsAdmin/> : tab==='users' ? <UsersAdmin/> : <IntegrationsAdmin/>}
         </div>
       </div>
     </div>
@@ -779,6 +780,213 @@ function UsersAdmin(){
       </div>
 
       {msg && <div style={ui.toast}>{msg}</div>}
+    </div>
+  )
+}
+
+/* ============================ INTÉGRATIONS (VMware / Stockage) ============================ */
+const emptyVmForm = { name:'', vcenterHost:'', vcenterUser:'', vcenterPass:'', esxiHostsText:'', esxiUser:'', esxiPass:'' }
+
+function VMwareConnectionsAdmin(){
+  const [connections, setConnections] = React.useState([])
+  const [loading, setLoading] = React.useState(true)
+  const [msg, setMsg] = React.useState('')
+  const [editId, setEditId] = React.useState(null)
+  const [form, setForm] = React.useState(emptyVmForm)
+
+  const load = React.useCallback(async ()=>{
+    setLoading(true)
+    try{
+      const res = await fetch(`${API}/integrations/vmware/connections`, { headers: authHeader() })
+      const data = await res.json()
+      setConnections(Array.isArray(data) ? data : [])
+    }catch{ setMsg('Erreur lors du chargement des connexions VMware') }
+    finally{ setLoading(false) }
+  },[])
+  React.useEffect(()=>{ load() },[load])
+
+  const onEdit = (c) => {
+    setEditId(c.id)
+    setForm({
+      name: c.name || '',
+      vcenterHost: c.vcenterHost || '',
+      vcenterUser: c.vcenterUser || '',
+      vcenterPass: '',
+      esxiHostsText: (c.esxiHosts || []).join(', '),
+      esxiUser: c.esxiUser || '',
+      esxiPass: ''
+    })
+  }
+  const onCancel = () => { setEditId(null); setForm(emptyVmForm) }
+
+  const onDelete = async (id) => {
+    if (!confirm('Supprimer cette connexion VMware ?')) return
+    try{
+      const res = await fetch(`${API}/integrations/vmware/connections/${id}`, { method:'DELETE', headers: authHeader() })
+      if (!res.ok) throw new Error()
+      setMsg('Connexion supprimée ✅')
+      if (editId === id) onCancel()
+      load()
+    }catch{ setMsg('Erreur lors de la suppression') }
+  }
+
+  const onCollectNow = async (id) => {
+    setMsg('')
+    try{
+      const res = await fetch(`${API}/integrations/vmware/connections/${id}/trigger`, { method:'POST', headers: authHeader() })
+      if (!res.ok) throw new Error()
+      setMsg('Collecte demandée — sera traitée sous ~10 secondes ✅')
+    }catch{ setMsg('Erreur lors de la demande de collecte') }
+  }
+
+  const submit = async (e) => {
+    e.preventDefault(); setMsg('')
+    if (!editId && !form.name.trim()) { setMsg('Un nom est requis pour identifier la connexion'); return }
+    const payload = {
+      name: form.name.trim(),
+      vcenterHost: form.vcenterHost.trim(),
+      vcenterUser: form.vcenterUser.trim(),
+      esxiHosts: form.esxiHostsText.split(',').map(s=>s.trim()).filter(Boolean),
+      esxiUser: form.esxiUser.trim()
+    }
+    if (form.vcenterPass) payload.vcenterPass = form.vcenterPass
+    if (form.esxiPass) payload.esxiPass = form.esxiPass
+    try{
+      const url = editId ? `${API}/integrations/vmware/connections/${editId}` : `${API}/integrations/vmware/connections`
+      const res = await fetch(url, { method: editId ? 'PUT' : 'POST', headers: jsonHeader(), body: JSON.stringify(payload) })
+      if (!res.ok) throw new Error()
+      setMsg(editId ? 'Connexion mise à jour ✅' : 'Connexion ajoutée ✅')
+      onCancel()
+      load()
+    }catch{ setMsg("Erreur lors de l'enregistrement") }
+  }
+
+  const boxStyle = { background:'rgba(0,0,0,0.2)', border:'1px solid rgba(239,68,68,0.3)', borderRadius:12, padding:16 }
+  const gridStyle = { display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(180px, 1fr))', gap:12, marginBottom:12 }
+
+  return (
+    <div style={boxStyle}>
+      <div style={{fontWeight:600, marginBottom:4, color:'#fff'}}>Connexions VMware (vCenter ou ESXi)</div>
+      <div style={{...ui.muted, marginBottom:12}}>
+        Ajoutez une connexion par vCenter/site. Chaque hyperviseur collecté est tagué avec le nom
+        de sa connexion, utilisable comme filtre sur la page VMware.
+      </div>
+
+      {loading ? (
+        <div style={{padding:10, ...ui.muted}}>Chargement…</div>
+      ) : connections.length > 0 && (
+        <div style={{marginBottom:16}}>
+          {connections.map(c => (
+            <div key={c.id} style={{display:'flex', alignItems:'center', justifyContent:'space-between', padding:'8px 12px', background:'rgba(0,0,0,0.15)', borderRadius:8, marginBottom:6}}>
+              <div>
+                <span style={{fontWeight:600, color:'#fff'}}>{c.name}</span>
+                <span style={{...ui.muted, marginLeft:10}}>
+                  {c.vcenterHost ? `vCenter: ${c.vcenterHost}` : (c.esxiHosts||[]).length ? `ESXi: ${(c.esxiHosts||[]).join(', ')}` : 'Non configuré'}
+                </span>
+              </div>
+              <div style={ui.rowActions}>
+                <button style={ui.btn} type="button" onClick={()=>onCollectNow(c.id)}>Collecter maintenant</button>
+                <button style={ui.btn} type="button" onClick={()=>onEdit(c)}>Éditer</button>
+                <button style={ui.btn} type="button" onClick={()=>onDelete(c.id)}>Supprimer</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{fontWeight:500, marginBottom:8, color:'#fff'}}>{editId ? 'Modifier la connexion' : 'Ajouter une connexion'}</div>
+      <form onSubmit={submit}>
+        <div style={gridStyle}>
+          <input style={ui.input} placeholder="Nom (ex: Site Milan)" value={form.name} onChange={e=>setForm(f=>({...f, name:e.target.value}))} />
+          <input style={ui.input} placeholder="Hôte vCenter (ex: vcenter.semmaris.local)" value={form.vcenterHost} onChange={e=>setForm(f=>({...f, vcenterHost:e.target.value}))} />
+          <input style={ui.input} placeholder="Utilisateur vCenter" value={form.vcenterUser} onChange={e=>setForm(f=>({...f, vcenterUser:e.target.value}))} />
+          <input style={ui.input} type="password" placeholder="Mot de passe vCenter" value={form.vcenterPass} onChange={e=>setForm(f=>({...f, vcenterPass:e.target.value}))} />
+        </div>
+        <div style={{...ui.muted, marginBottom:8}}>Ou connexion directe à un/des hôtes ESXi (sans vCenter) :</div>
+        <div style={gridStyle}>
+          <input style={ui.input} placeholder="IPs des hôtes ESXi, séparées par des virgules" value={form.esxiHostsText} onChange={e=>setForm(f=>({...f, esxiHostsText:e.target.value}))} />
+          <input style={ui.input} placeholder="Utilisateur ESXi (ex: root)" value={form.esxiUser} onChange={e=>setForm(f=>({...f, esxiUser:e.target.value}))} />
+          <input style={ui.input} type="password" placeholder="Mot de passe ESXi" value={form.esxiPass} onChange={e=>setForm(f=>({...f, esxiPass:e.target.value}))} />
+        </div>
+        <div style={{display:'flex', gap:8}}>
+          <button style={ui.btn} type="submit">{editId ? 'Mettre à jour' : 'Ajouter la connexion'}</button>
+          {editId && <button style={ui.btn} type="button" onClick={onCancel}>Annuler</button>}
+        </div>
+      </form>
+
+      {msg && <div style={ui.toast}>{msg}</div>}
+    </div>
+  )
+}
+
+function IntegrationsAdmin(){
+  const [storage, setStorage] = React.useState({ configured:false })
+  const [stForm, setStForm]   = React.useState({ hostsText:'', apiUser:'', apiPass:'', snmpCommunity:'public' })
+  const [loading, setLoading] = React.useState(true)
+  const [msg, setMsg]         = React.useState('')
+
+  const load = React.useCallback(async ()=>{
+    setLoading(true)
+    try{
+      const sRes = await fetch(`${API}/integrations/storage`, { headers: authHeader() })
+      const s = await sRes.json()
+      setStorage(s)
+      setStForm(f => ({ ...f, hostsText: (s.hosts||[]).join(', '), apiUser: s.apiUser||'', snmpCommunity: s.snmpCommunity||'public' }))
+    }catch{ setMsg('Erreur lors du chargement des intégrations') }
+    finally{ setLoading(false) }
+  },[])
+  React.useEffect(()=>{ load() },[load])
+
+  const saveStorage = async (e)=>{
+    e.preventDefault(); setMsg('')
+    const payload = {
+      hosts: stForm.hostsText.split(',').map(s=>s.trim()).filter(Boolean),
+      apiUser: stForm.apiUser.trim(),
+      snmpCommunity: stForm.snmpCommunity.trim() || 'public'
+    }
+    if (stForm.apiPass) payload.apiPass = stForm.apiPass
+    try{
+      const res = await fetch(`${API}/integrations/storage`, { method:'PUT', headers: jsonHeader(), body: JSON.stringify(payload) })
+      if (!res.ok) throw new Error()
+      setMsg('Connexion Stockage enregistrée ✅')
+      setStForm(f=>({...f, apiPass:''}))
+      load()
+    }catch{ setMsg("Erreur lors de l'enregistrement Stockage") }
+  }
+
+  if (loading) return <div style={{padding:10, ...ui.muted}}>Chargement…</div>
+
+  const boxStyle = { background:'rgba(0,0,0,0.2)', border:'1px solid rgba(239,68,68,0.3)', borderRadius:12, padding:16 }
+  const gridStyle = { display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(200px, 1fr))', gap:12, marginBottom:12 }
+
+  return (
+    <div style={{display:'grid', gap:20}}>
+      <VMwareConnectionsAdmin/>
+
+      <div style={boxStyle}>
+        <div style={{fontWeight:600, marginBottom:4, color:'#fff'}}>Connexion Stockage (Seagate)</div>
+        <div style={{...ui.muted, marginBottom:12}}>
+          {storage.configured
+            ? `Configuré${storage.updatedAt ? ' — dernière modification ' + new Date(storage.updatedAt).toLocaleString('fr-FR') : ''}`
+            : 'Non configuré'}
+        </div>
+        <form onSubmit={saveStorage}>
+          <div style={gridStyle}>
+            <input style={ui.input} placeholder="IPs des baies, séparées par des virgules" value={stForm.hostsText} onChange={e=>setStForm(f=>({...f, hostsText:e.target.value}))} />
+            <input style={ui.input} placeholder="Utilisateur API (ex: manage)" value={stForm.apiUser} onChange={e=>setStForm(f=>({...f, apiUser:e.target.value}))} />
+            <input style={ui.input} type="password" placeholder={storage.hasApiPass ? 'Mot de passe API (déjà défini)' : 'Mot de passe API'} value={stForm.apiPass} onChange={e=>setStForm(f=>({...f, apiPass:e.target.value}))} />
+            <input style={ui.input} placeholder="Communauté SNMP" value={stForm.snmpCommunity} onChange={e=>setStForm(f=>({...f, snmpCommunity:e.target.value}))} />
+          </div>
+          <button style={ui.btn} type="submit">Enregistrer la connexion Stockage</button>
+        </form>
+      </div>
+
+      {msg && <div style={ui.toast}>{msg}</div>}
+      <div style={ui.muted}>
+        Ces identifiants sont chiffrés en base (jamais réaffichés en clair). Les scripts de collecte
+        (CollectHyperviseurInfo.ps1 / CollectStorageInfo.ps1) les récupèrent automatiquement à chaque
+        cycle — pas besoin de relancer les conteneurs après une modification.
+      </div>
     </div>
   )
 }

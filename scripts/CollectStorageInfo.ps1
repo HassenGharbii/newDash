@@ -11,6 +11,14 @@
 .EXEMPLE
     .\CollectStorageInfo.ps1 -StorageHosts @("192.168.1.20","192.168.1.21") -SnmpCommunity "public"
     .\CollectStorageInfo.ps1 -StorageHosts @("192.168.1.20") -ApiUser "manage" -ApiPass "!manage"
+    .\CollectStorageInfo.ps1 -Loop -IntervalSeconds 300
+
+.DESCRIPTION (suite)
+    Deux modes :
+    - Ponctuel (par défaut si -StorageHosts/STORAGE_HOSTS sont fournis) : une seule collecte puis sortie.
+    - Continu (-Loop, ou automatique si aucune baie n'est fournie) : récupère la configuration
+      (liste de baies + identifiants) depuis l'API (Panel Admin > Intégrations,
+      GET /integrations/storage/config) à chaque cycle. C'est le mode utilisé par le conteneur Docker.
 #>
 
 param(
@@ -28,7 +36,11 @@ param(
 
     # Dashboard API
     [string]$DashboardApiUrl  = $(if ($env:API_URL) { $env:API_URL } else { "http://localhost:4000" }),
-    [string]$IngestKey        = $(if ($env:INGEST_KEY) { $env:INGEST_KEY } else { "dev-ingest-key" })
+    [string]$IngestKey        = $(if ($env:INGEST_KEY) { $env:INGEST_KEY } else { "dev-ingest-key" }),
+
+    # Mode continu (recupere la config depuis l'API a chaque cycle)
+    [switch]$Loop,
+    [int]$IntervalSeconds = 300
 )
 
 Set-StrictMode -Version Latest
@@ -40,16 +52,25 @@ function Write-Log {
     Write-Host "[$ts][$Level] $Message"
 }
 
-# Ignorer les certificats auto-signés des baies
-Add-Type @"
+# Ignorer les certificats auto-signés des baies.
+# ICertificatePolicy/ServicePointManager.CertificatePolicy est une API .NET Framework qui
+# n'existe plus sous .NET Core/PowerShell 7 (Linux) - on utilise -SkipCertificateCheck la ou
+# disponible (PS6+), et on ne retombe sur l'ancien hack ServicePointManager que sous
+# Windows PowerShell 5.1.
+$script:SkipCertParam = @{}
+if ($PSVersionTable.PSVersion.Major -ge 6) {
+    $script:SkipCertParam = @{ SkipCertificateCheck = $true }
+} else {
+    Add-Type @"
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 public class TrustAll : ICertificatePolicy {
     public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
 }
 "@ -ErrorAction SilentlyContinue
-[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAll
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+}
 
 # ─── Envoi vers le dashboard ─────────────────────────────────────────────────
 function Send-StorageData {
@@ -72,8 +93,11 @@ function Send-StorageData {
 
 # ─── Ping de disponibilité ───────────────────────────────────────────────────
 function Test-StoragePing {
-    param([string]$Host)
-    $ping = Test-Connection -ComputerName $Host -Count 1 -Quiet -ErrorAction SilentlyContinue
+    # Note : $Host est une variable automatique PowerShell (objet hote de la console) -
+    # on ne peut pas l'utiliser comme nom de parametre ("Cannot overwrite variable Host
+    # because it is read-only or constant").
+    param([string]$TargetHost)
+    $ping = Test-Connection -ComputerName $TargetHost -Count 1 -Quiet -ErrorAction SilentlyContinue
     return $ping
 }
 
@@ -97,7 +121,7 @@ function Collect-SeagateREST {
 
         $loginUrl = "$baseUrl/api/login/$hash"
         $authResp  = Invoke-RestMethod -Uri $loginUrl -Method GET -TimeoutSec 10 `
-            -Headers @{ "dataType" = "json" }
+            -Headers @{ "dataType" = "json" } @script:SkipCertParam
 
         $sessionToken = $authResp.status[0].response
         if (-not $sessionToken) {
@@ -112,17 +136,17 @@ function Collect-SeagateREST {
 
         # 2. Informations système
         $sysInfo = Invoke-RestMethod -Uri "$baseUrl/api/show/system" `
-            -Headers $apiHeaders -TimeoutSec 10
+            -Headers $apiHeaders -TimeoutSec 10 @script:SkipCertParam
         $sys = $sysInfo.objects[0]
 
         # 3. Volumes et capacité
         $volInfo = Invoke-RestMethod -Uri "$baseUrl/api/show/volumes" `
-            -Headers $apiHeaders -TimeoutSec 10
+            -Headers $apiHeaders -TimeoutSec 10 @script:SkipCertParam
         $volumes = $volInfo.objects
 
         # Capacité globale depuis les pools
         $poolInfo = Invoke-RestMethod -Uri "$baseUrl/api/show/pools" `
-            -Headers $apiHeaders -TimeoutSec 10
+            -Headers $apiHeaders -TimeoutSec 10 @script:SkipCertParam
         $pools = $poolInfo.objects
 
         $totalCapGBRaw = ($pools | Measure-Object -Property total-size-numeric -Sum).Sum
@@ -136,7 +160,7 @@ function Collect-SeagateREST {
 
         # 4. Disques
         $diskInfo = Invoke-RestMethod -Uri "$baseUrl/api/show/disks" `
-            -Headers $apiHeaders -TimeoutSec 10
+            -Headers $apiHeaders -TimeoutSec 10 @script:SkipCertParam
         $allDisks = $diskInfo.objects
         $disksOk       = ($allDisks | Where-Object { $_.health -eq "OK" }).Count
         $disksFailed   = ($allDisks | Where-Object { $_.health -ne "OK" -and $_.health -ne "N/A" }).Count
@@ -144,7 +168,7 @@ function Collect-SeagateREST {
 
         # 5. Contrôleurs
         $ctrlInfo = Invoke-RestMethod -Uri "$baseUrl/api/show/controllers" `
-            -Headers $apiHeaders -TimeoutSec 10
+            -Headers $apiHeaders -TimeoutSec 10 @script:SkipCertParam
         $controllers = $ctrlInfo.objects | ForEach-Object {
             @{
                 name   = $_.id
@@ -187,7 +211,7 @@ function Collect-SeagateREST {
         Write-Log "INFO" "REST collecté $StorageIp : santé=$($sys.health) | $totalCapTB To | $($allDisks.Count) disques"
 
         # Déconnexion
-        Invoke-RestMethod -Uri "$baseUrl/api/logout" -Headers $apiHeaders -TimeoutSec 5 | Out-Null
+        Invoke-RestMethod -Uri "$baseUrl/api/logout" -Headers $apiHeaders -TimeoutSec 5 @script:SkipCertParam | Out-Null
 
     } catch {
         Write-Log "WARN" "API REST $StorageIp échouée : $($_.Exception.Message)"
@@ -211,7 +235,7 @@ function Collect-SeagateSNMP {
     } catch {}
 
     # Construction du résultat basique (ping + disponibilité réseau)
-    $isUp = Test-StoragePing -Host $StorageIp
+    $isUp = Test-StoragePing -TargetHost $StorageIp
     return @{
         ip             = $StorageIp
         name           = "Seagate-$StorageIp"
@@ -221,57 +245,88 @@ function Collect-SeagateSNMP {
     }
 }
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
-Write-Log "INFO" "═══════ Collecte Baies Seagate Exos X ═══════"
-
-if ($StorageHosts.Count -eq 0) {
-    # Lire depuis variable d'env ou fichier de config
-    $envHosts = $env:STORAGE_HOSTS
-    if ($envHosts) {
-        $StorageHosts = $envHosts -split ","
-    } else {
-        Write-Log "ERROR" "Aucune baie configurée. Utilisez -StorageHosts ou définissez STORAGE_HOSTS."
-        Write-Log "INFO"  "Exemple: .\CollectStorageInfo.ps1 -StorageHosts @('192.168.1.20','192.168.1.21')"
-        exit 1
+# ─── Récupération de la config de connexion depuis l'API (mode continu) ─────
+function Get-RemoteStorageConfig {
+    try {
+        $headers = @{ "x-ingest-key" = $IngestKey }
+        return Invoke-RestMethod -Uri "$DashboardApiUrl/integrations/storage/config" -Method GET -Headers $headers -TimeoutSec 15
+    } catch {
+        Write-Log "WARN" "Impossible de récupérer la config Stockage depuis l'API: $($_.Exception.Message)"
+        return $null
     }
 }
 
-foreach ($storageIp in $StorageHosts) {
-    $storageIp = $storageIp.Trim()
-    Write-Log "INFO" "─── Baie : $storageIp ───"
+# ─── Un cycle complet de collecte sur une liste de baies ────────────────────
+function Invoke-StorageCollectionCycle {
+    param([string[]]$Hosts)
 
-    # 1. Test de disponibilité réseau
-    $isReachable = Test-StoragePing -Host $storageIp
-    Write-Log "INFO" "$storageIp : disponibilité réseau = $isReachable"
+    foreach ($storageIp in $Hosts) {
+        $storageIp = $storageIp.Trim()
+        if (-not $storageIp) { continue }
+        Write-Log "INFO" "─── Baie : $storageIp ───"
 
-    if (-not $isReachable) {
-        # Envoyer un statut DOWN même si inaccessible
-        Send-StorageData -Data @{
-            ip             = $storageIp
-            name           = "Seagate-$storageIp"
-            model          = "Seagate Exos X 5U84"
-            overall_status = "down"
-            health         = "Critical"
+        # 1. Test de disponibilité réseau
+        $isReachable = Test-StoragePing -TargetHost $storageIp
+        Write-Log "INFO" "$storageIp : disponibilité réseau = $isReachable"
+
+        if (-not $isReachable) {
+            Send-StorageData -Data @{
+                ip             = $storageIp
+                name           = "Seagate-$storageIp"
+                model          = "Seagate Exos X 5U84"
+                overall_status = "down"
+                health         = "Critical"
+            }
+            continue
         }
-        continue
-    }
 
-    # 2. Collecte détaillée via API REST (mode principal)
-    $data = $null
-    if ($ApiUser -and $ApiPass) {
-        $data = Collect-SeagateREST -StorageIp $storageIp
-    }
+        # 2. Collecte détaillée via API REST (mode principal)
+        $data = $null
+        if ($ApiUser -and $ApiPass) {
+            $data = Collect-SeagateREST -StorageIp $storageIp
+        }
 
-    # 3. Fallback SNMP/basique si REST échoue
-    if (-not $data) {
-        Write-Log "INFO" "$storageIp : fallback vers collecte SNMP basique"
-        $data = Collect-SeagateSNMP -StorageIp $storageIp
-    }
+        # 3. Fallback SNMP/basique si REST échoue
+        if (-not $data) {
+            Write-Log "INFO" "$storageIp : fallback vers collecte SNMP basique"
+            $data = Collect-SeagateSNMP -StorageIp $storageIp
+        }
 
-    # 4. Envoi au dashboard
-    if ($data) {
-        Send-StorageData -Data $data
+        # 4. Envoi au dashboard
+        if ($data) {
+            Send-StorageData -Data $data
+        }
     }
+}
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+Write-Log "INFO" "═══════ Collecte Baies Seagate Exos X ═══════"
+
+if ($StorageHosts.Count -eq 0 -and $env:STORAGE_HOSTS) {
+    $StorageHosts = $env:STORAGE_HOSTS -split ","
+}
+$hasExplicitHosts = $StorageHosts.Count -gt 0
+
+if ($Loop -or -not $hasExplicitHosts) {
+    Write-Log "INFO" "Mode continu - configuration récupérée depuis l'API (Panel Admin > Intégrations) toutes les ${IntervalSeconds}s"
+    while ($true) {
+        if ($hasExplicitHosts) {
+            Invoke-StorageCollectionCycle -Hosts $StorageHosts
+        } else {
+            $cfg = Get-RemoteStorageConfig
+            if ($cfg -and $cfg.configured -and $cfg.hosts -and $cfg.hosts.Count -gt 0) {
+                $ApiUser = $cfg.apiUser
+                $ApiPass = $cfg.apiPass
+                $SnmpCommunity = $cfg.snmpCommunity
+                Invoke-StorageCollectionCycle -Hosts $cfg.hosts
+            } else {
+                Write-Log "INFO" "Aucune baie configurée (Panel Admin > Intégrations). Nouvelle tentative dans ${IntervalSeconds}s."
+            }
+        }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+} else {
+    Invoke-StorageCollectionCycle -Hosts $StorageHosts
 }
 
 Write-Log "INFO" "═══════ Collecte Stockage terminée ═══════"

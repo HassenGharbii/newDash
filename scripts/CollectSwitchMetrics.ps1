@@ -3,7 +3,9 @@
 
 param(
     [string]$ConfigFile,
-    [string]$SnmpCommunity = "public"
+    [string]$SnmpCommunity = "public",
+    [switch]$Loop,
+    [int]$IntervalSeconds = 120
 )
 
 # Déterminer le chemin du script
@@ -454,15 +456,16 @@ function Send-SwitchMetrics {
     }
 }
 
-# ---------- MAIN ----------
+# ---------- UN CYCLE DE COLLECTE ----------
+function Invoke-SwitchMetricsCycle {
 
 # Authentification
 Write-Host "[AUTH] Authentification..." -ForegroundColor Yellow
 $token = Get-AuthToken -apiBase $apiBase -email $config.adminEmail -password $config.adminPassword
 
 if (-not $token) {
-    Write-Error "Impossible de s'authentifier"
-    exit 1
+    Write-Warning "Impossible de s'authentifier"
+    return
 }
 
 Write-Host "[AUTH] OK" -ForegroundColor Green
@@ -474,7 +477,7 @@ $switches = Get-SwitchesFromAPI -Token $token
 
 if ($switches.Count -eq 0) {
     Write-Warning "Aucun switch trouvé dans la base de données"
-    exit 0
+    return
 }
 
 Write-Host "[LOAD] OK - $($switches.Count) switch(es) trouvé(s)" -ForegroundColor Green
@@ -527,3 +530,15 @@ if (-not $snmpAvailable) {
 }
 
 Write-Host "[DONE] Collecte terminée" -ForegroundColor Green
+}
+
+# ---------- MAIN ----------
+if ($Loop) {
+    Write-Host "Mode continu - intervalle ${IntervalSeconds}s" -ForegroundColor Cyan
+    while ($true) {
+        Invoke-SwitchMetricsCycle
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+} else {
+    Invoke-SwitchMetricsCycle
+}

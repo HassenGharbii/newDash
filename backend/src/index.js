@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import * as XLSX from 'xlsx';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -83,7 +84,8 @@ const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
   corsOrigin: process.env.CORS_ORIGIN || '*',
   adminSeedPassword: process.env.ADMIN_SEED_PASSWORD || 'admin123',
-  userSeedPassword: process.env.USER_SEED_PASSWORD || 'user123'
+  userSeedPassword: process.env.USER_SEED_PASSWORD || 'user123',
+  encryptionKey: process.env.ENCRYPTION_KEY || 'devsecret-encryption-key-dev-only'
 };
 
 logger.info('🚀 Configuration de développement chargée', {
@@ -96,6 +98,31 @@ if (config.nodeEnv !== 'test') {
   if (config.jwtSecret === 'devsecret-dev-only') logger.warn('JWT_SECRET is not set - using an insecure default. Set it via env var before deploying.');
   if (config.ingestKey === 'dev-ingest-key') logger.warn('INGEST_KEY is not set - using an insecure default. Set it via env var before deploying.');
   if (config.adminSeedPassword === 'admin123') logger.warn('ADMIN_SEED_PASSWORD is not set - the admin account will seed with a well-known default password. Set it via env var, or change the password afterwards via the Admin Panel.');
+  if (config.encryptionKey === 'devsecret-encryption-key-dev-only') logger.warn('ENCRYPTION_KEY is not set - using an insecure default to encrypt stored integration credentials (VMware/Storage). Set it via env var before deploying.');
+}
+
+// ---------- ENCRYPTION (stored VMware/Storage credentials) ----------
+// AES-256-GCM. The key can be any string - it's hashed to a fixed 32-byte key.
+const ENCRYPTION_KEY_BYTES = crypto.createHash('sha256').update(config.encryptionKey).digest();
+
+function encryptJson(obj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY_BYTES, iv);
+  const plaintext = Buffer.from(JSON.stringify(obj), 'utf8');
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([iv, authTag, encrypted]).toString('base64');
+}
+
+function decryptJson(blob) {
+  const raw = Buffer.from(blob, 'base64');
+  const iv = raw.subarray(0, 12);
+  const authTag = raw.subarray(12, 28);
+  const encrypted = raw.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY_BYTES, iv);
+  decipher.setAuthTag(authTag);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  return JSON.parse(decrypted.toString('utf8'));
 }
 
 const upload = multer({ 
@@ -324,8 +351,37 @@ CREATE TABLE IF NOT EXISTS storage_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_storage_metrics_equipment_time ON storage_metrics(equipment_id, collected_at);
 
+CREATE TABLE IF NOT EXISTS integration_config (
+  kind TEXT PRIMARY KEY,
+  config_encrypted TEXT NOT NULL,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS vmware_connections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  config_encrypted TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Equipment table ready
 `);
+
+// Migration: move the old single-row vmware integration_config (if any) into
+// vmware_connections, so existing saved credentials aren't lost when multi-connection
+// support was added.
+{
+  const vmwareConnCount = db.prepare('SELECT COUNT(*) as c FROM vmware_connections').get().c;
+  if (vmwareConnCount === 0) {
+    const legacy = db.prepare("SELECT config_encrypted FROM integration_config WHERE kind='vmware'").get();
+    if (legacy) {
+      db.prepare('INSERT INTO vmware_connections (name, config_encrypted) VALUES (?, ?)')
+        .run('Connexion 1', legacy.config_encrypted);
+      logger.info('Migrated legacy single VMware integration config into vmware_connections');
+    }
+  }
+}
 
 // ---------- MIGRATIONS ----------
 // Add equipment_type column to bandwidth_data if it doesn't exist
@@ -334,6 +390,14 @@ const hasEquipmentType = bandwidthColumns.some(col => col.name === 'equipment_ty
 if (!hasEquipmentType) {
   logger.info('Adding equipment_type column to bandwidth_data table');
   db.prepare('ALTER TABLE bandwidth_data ADD COLUMN equipment_type TEXT').run();
+}
+
+// Add trigger_requested_at to vmware_connections - lets the "Collecter maintenant" button
+// signal the collector to run immediately instead of waiting for the next polling interval.
+const vmwareConnColumns = db.prepare("PRAGMA table_info(vmware_connections)").all();
+if (!vmwareConnColumns.some(col => col.name === 'trigger_requested_at')) {
+  logger.info('Adding trigger_requested_at column to vmware_connections table');
+  db.prepare('ALTER TABLE vmware_connections ADD COLUMN trigger_requested_at TEXT').run();
 }
 
 // Migration V3: Remove restrictive CHECK constraint on equipment.type to allow Hyperviseur and Stockage
@@ -523,6 +587,207 @@ app.delete('/users/:id', auth('Admin'), (req,res)=>{
     res.json({ ok: true });
   } catch (e) {
     console.error('DELETE /users/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- INTEGRATIONS (VMware / Storage connection settings) ----------
+// Storage keeps the single-config model (one shared credential for all Seagate hosts).
+// VMware supports multiple named connections (see vmware_connections below) - each can be
+// its own vCenter or ESXi group with its own credentials, and the frontend can filter by name.
+const INTEGRATION_KINDS = ['storage'];
+
+function getIntegrationConfig(kind) {
+  const row = db.prepare('SELECT config_encrypted, updated_at FROM integration_config WHERE kind=?').get(kind);
+  if (!row) return null;
+  return { data: decryptJson(row.config_encrypted), updatedAt: row.updated_at };
+}
+
+// Admin-only: summary with secrets masked, never returns raw passwords
+app.get('/integrations/:kind', auth('Admin'), (req, res) => {
+  const kind = req.params.kind;
+  if (!INTEGRATION_KINDS.includes(kind)) return res.status(400).json({ error: 'invalid kind' });
+  try {
+    const existing = getIntegrationConfig(kind);
+    if (!existing) return res.json({ configured: false });
+
+    const d = existing.data || {};
+    return res.json({
+      configured: true,
+      updatedAt: existing.updatedAt,
+      hosts: d.hosts || [],
+      apiUser: d.apiUser || '',
+      hasApiPass: !!d.apiPass,
+      snmpCommunity: d.snmpCommunity || ''
+    });
+  } catch (e) {
+    console.error('GET /integrations/:kind error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Admin-only: save connection settings (full replace). Merges with existing secrets
+// when a password field is omitted/blank, so the UI never needs to redisplay it.
+app.put('/integrations/:kind', auth('Admin'), (req, res) => {
+  const kind = req.params.kind;
+  if (!INTEGRATION_KINDS.includes(kind)) return res.status(400).json({ error: 'invalid kind' });
+  try {
+    const existing = getIntegrationConfig(kind);
+    const prev = existing ? existing.data : {};
+    const body = req.body || {};
+
+    const next = {
+      hosts: Array.isArray(body.hosts) ? body.hosts.filter(Boolean) : (prev.hosts || []),
+      apiUser: (body.apiUser ?? prev.apiUser ?? '').toString().trim(),
+      apiPass: body.apiPass ? body.apiPass.toString() : (prev.apiPass || ''),
+      snmpCommunity: (body.snmpCommunity ?? prev.snmpCommunity ?? 'public').toString().trim()
+    };
+
+    const encrypted = encryptJson(next);
+    db.prepare(`
+      INSERT INTO integration_config (kind, config_encrypted, updated_at) VALUES (?, ?, datetime('now'))
+      ON CONFLICT(kind) DO UPDATE SET config_encrypted=excluded.config_encrypted, updated_at=datetime('now')
+    `).run(kind, encrypted);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PUT /integrations/:kind error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Used only by the collector scripts (CollectHyperviseurInfo.ps1 / CollectStorageInfo.ps1) -
+// returns the FULL decrypted config including passwords. Protected by ingest key, not JWT,
+// since these run unattended.
+app.get('/integrations/:kind/config', requireIngestKey, (req, res) => {
+  const kind = req.params.kind;
+  if (!INTEGRATION_KINDS.includes(kind)) return res.status(400).json({ error: 'invalid kind' });
+  try {
+    const existing = getIntegrationConfig(kind);
+    if (!existing) return res.json({ configured: false });
+    res.json({ configured: true, ...existing.data });
+  } catch (e) {
+    console.error('GET /integrations/:kind/config error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- VMware CONNECTIONS (multiple named vCenter/ESXi groups) ----------
+
+// Admin-only: list all connections, secrets masked
+app.get('/integrations/vmware/connections', auth('Admin'), (req, res) => {
+  try {
+    const rows = db.prepare('SELECT id, name, config_encrypted, updated_at FROM vmware_connections ORDER BY id ASC').all();
+    res.json(rows.map(row => {
+      const d = decryptJson(row.config_encrypted) || {};
+      return {
+        id: row.id,
+        name: row.name,
+        updatedAt: row.updated_at,
+        vcenterHost: d.vcenterHost || '',
+        vcenterUser: d.vcenterUser || '',
+        hasVcenterPass: !!d.vcenterPass,
+        esxiHosts: d.esxiHosts || [],
+        esxiUser: d.esxiUser || '',
+        hasEsxiPass: !!d.esxiPass
+      };
+    }));
+  } catch (e) {
+    console.error('GET /integrations/vmware/connections error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Admin-only: create a new named connection
+app.post('/integrations/vmware/connections', auth('Admin'), (req, res) => {
+  try {
+    const body = req.body || {};
+    const name = (body.name || '').toString().trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+
+    const data = {
+      vcenterHost: (body.vcenterHost || '').toString().trim(),
+      vcenterUser: (body.vcenterUser || '').toString().trim(),
+      vcenterPass: (body.vcenterPass || '').toString(),
+      esxiHosts: Array.isArray(body.esxiHosts) ? body.esxiHosts.filter(Boolean) : [],
+      esxiUser: (body.esxiUser || '').toString().trim(),
+      esxiPass: (body.esxiPass || '').toString()
+    };
+
+    const encrypted = encryptJson(data);
+    const ins = db.prepare('INSERT INTO vmware_connections (name, config_encrypted) VALUES (?, ?)').run(name, encrypted);
+    res.json({ ok: true, id: ins.lastInsertRowid });
+  } catch (e) {
+    console.error('POST /integrations/vmware/connections error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Admin-only: update a connection (merges - omitted password fields keep their old value)
+app.put('/integrations/vmware/connections/:id', auth('Admin'), (req, res) => {
+  try {
+    const row = db.prepare('SELECT * FROM vmware_connections WHERE id=?').get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const prev = decryptJson(row.config_encrypted) || {};
+    const body = req.body || {};
+
+    const name = body.name !== undefined ? body.name.toString().trim() : row.name;
+    const data = {
+      vcenterHost: (body.vcenterHost ?? prev.vcenterHost ?? '').toString().trim(),
+      vcenterUser: (body.vcenterUser ?? prev.vcenterUser ?? '').toString().trim(),
+      vcenterPass: body.vcenterPass ? body.vcenterPass.toString() : (prev.vcenterPass || ''),
+      esxiHosts: Array.isArray(body.esxiHosts) ? body.esxiHosts.filter(Boolean) : (prev.esxiHosts || []),
+      esxiUser: (body.esxiUser ?? prev.esxiUser ?? '').toString().trim(),
+      esxiPass: body.esxiPass ? body.esxiPass.toString() : (prev.esxiPass || '')
+    };
+
+    const encrypted = encryptJson(data);
+    db.prepare("UPDATE vmware_connections SET name=?, config_encrypted=?, updated_at=datetime('now') WHERE id=?")
+      .run(name, encrypted, req.params.id);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PUT /integrations/vmware/connections/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Admin-only: delete a connection
+app.delete('/integrations/vmware/connections/:id', auth('Admin'), (req, res) => {
+  try {
+    db.prepare('DELETE FROM vmware_connections WHERE id=?').run(req.params.id);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /integrations/vmware/connections/:id error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Admin-only: ask the collector to poll this connection immediately instead of waiting
+// for the next regular interval. The collector picks this up within ~10s.
+app.post('/integrations/vmware/connections/:id/trigger', auth('Admin'), (req, res) => {
+  try {
+    const result = db.prepare("UPDATE vmware_connections SET trigger_requested_at=datetime('now') WHERE id=?").run(req.params.id);
+    if (result.changes === 0) return res.status(404).json({ error: 'not found' });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('POST /integrations/vmware/connections/:id/trigger error:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Used only by CollectHyperviseurInfo.ps1 - returns ALL connections fully decrypted.
+// Protected by ingest key, not JWT, since the collector runs unattended.
+app.get('/integrations/vmware/connections/config', requireIngestKey, (req, res) => {
+  try {
+    const rows = db.prepare('SELECT id, name, config_encrypted, trigger_requested_at FROM vmware_connections ORDER BY id ASC').all();
+    res.json(rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      triggerRequestedAt: row.trigger_requested_at,
+      ...decryptJson(row.config_encrypted)
+    })));
+  } catch (e) {
+    console.error('GET /integrations/vmware/connections/config error:', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -1853,7 +2118,7 @@ app.post('/ingest/hyperviseur', requireIngestKey, (req, res) => {
             cpu_usage_pct, memory_usage_pct, memory_total_gb, memory_used_gb,
             vm_total, vm_running, vm_stopped, vm_suspended,
             uptime_days, cpu_sockets, cpu_cores_total, cpu_mhz,
-            datastores, status } = req.body || {};
+            datastores, vms, status, connection_name } = req.body || {};
 
     if (!ip && !hostname) return res.status(400).json({ error: 'ip or hostname required' });
 
@@ -1889,6 +2154,8 @@ app.post('/ingest/hyperviseur', requireIngestKey, (req, res) => {
       cpu_cores_total: cpu_cores_total || 0,
       cpu_mhz: cpu_mhz || 0,
       datastores: datastores || [],
+      vms: vms || [],
+      connection_name: connection_name || null,
       collected_at: new Date().toISOString()
     };
 

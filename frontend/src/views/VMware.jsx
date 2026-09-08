@@ -93,6 +93,9 @@ function HyperviseurCard({ host, onSelect, isSelected }) {
           {info.esxi_version && (
             <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '2px' }}>ESXi {info.esxi_version}</div>
           )}
+          {info.connection_name && (
+            <div style={{ fontSize: '11px', color: '#2563eb', marginTop: '2px' }}>{info.connection_name}</div>
+          )}
         </div>
         <StatusBadge status={host.ping_status} />
       </div>
@@ -144,9 +147,24 @@ function HistorySection({ history }) {
   )
 }
 
+function VmPowerBadge({ state }) {
+  const s = (state || '').toLowerCase()
+  const isOn = s === 'poweredon'
+  const isSuspended = s === 'suspended'
+  const color = isOn ? '#16a34a' : isSuspended ? '#d97706' : '#dc2626'
+  const bg = isOn ? '#dcfce7' : isSuspended ? '#fef3c7' : '#fee2e2'
+  const label = isOn ? 'En cours' : isSuspended ? 'Suspendue' : 'Arrêtée'
+  return (
+    <span style={{ padding: '2px 8px', borderRadius: '999px', fontSize: '11px', fontWeight: '600', backgroundColor: bg, color }}>
+      {label}
+    </span>
+  )
+}
+
 function HyperviseurDetail({ host, history }) {
   const info = host.info_json || {}
   const datastores = info.datastores || []
+  const vms = info.vms || []
 
   return (
     <div style={{ background: 'white', borderRadius: '12px', padding: '24px', boxShadow: '0 1px 3px rgba(0,0,0,0.08)' }}>
@@ -198,6 +216,28 @@ function HyperviseurDetail({ host, history }) {
             </div>
           ))}
         </div>
+
+        {vms.length > 0 && (
+          <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {vms.map((vm, i) => (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '8px 10px', background: 'white', borderRadius: '6px', border: '1px solid #e5e7eb', fontSize: '12px'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                  <VmPowerBadge state={vm.power_state} />
+                  <span style={{ fontWeight: '600', color: '#1f2937', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{vm.name}</span>
+                </div>
+                <div style={{ display: 'flex', gap: '14px', color: '#6b7280', flexShrink: 0 }}>
+                  {vm.ip_address && <span style={{ fontFamily: 'monospace' }}>{vm.ip_address}</span>}
+                  {vm.guest_os && <span>{vm.guest_os}</span>}
+                  <span>{vm.cpu_count || '?'} vCPU</span>
+                  <span>{vm.memory_gb ? `${vm.memory_gb} GB` : '?'}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Historique */}
@@ -239,6 +279,7 @@ export default function VMware() {
   const [selected, setSelected] = React.useState(null)
   const [history, setHistory] = React.useState([])
   const [loading, setLoading] = React.useState(true)
+  const [connectionFilter, setConnectionFilter] = React.useState('')
 
   const fetchHosts = React.useCallback(async () => {
     try {
@@ -272,9 +313,12 @@ export default function VMware() {
     return () => { cancelled = true }
   }, [selected?.id])
 
-  const totalVMs = hosts.reduce((acc, h) => acc + (h.info_json?.vm_total || 0), 0)
-  const runningVMs = hosts.reduce((acc, h) => acc + (h.info_json?.vm_running || 0), 0)
-  const hostsUp = hosts.filter(h => h.ping_status === 'UP').length
+  const connectionNames = [...new Set(hosts.map(h => h.info_json?.connection_name).filter(Boolean))]
+  const visibleHosts = connectionFilter ? hosts.filter(h => h.info_json?.connection_name === connectionFilter) : hosts
+
+  const totalVMs = visibleHosts.reduce((acc, h) => acc + (h.info_json?.vm_total || 0), 0)
+  const runningVMs = visibleHosts.reduce((acc, h) => acc + (h.info_json?.vm_running || 0), 0)
+  const hostsUp = visibleHosts.filter(h => h.ping_status === 'UP').length
 
   if (loading) {
     return (
@@ -303,7 +347,19 @@ export default function VMware() {
 
   return (
     <div className="home-wrap">
-      <h1 className="page-title">VMware — Hyperviseurs ESXi</h1>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px' }}>
+        <h1 className="page-title">VMware — Hyperviseurs ESXi</h1>
+        {connectionNames.length > 1 && (
+          <select
+            value={connectionFilter}
+            onChange={e => setConnectionFilter(e.target.value)}
+            style={{ padding: '8px 12px', borderRadius: '8px', border: '1px solid #e5e7eb', fontSize: '13px', background: 'white' }}
+          >
+            <option value="">Toutes les connexions</option>
+            {connectionNames.map(name => <option key={name} value={name}>{name}</option>)}
+          </select>
+        )}
+      </div>
 
       {/* KPIs globaux */}
       <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', flexWrap: 'wrap' }}>
@@ -326,7 +382,7 @@ export default function VMware() {
       <div style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 380px) 1fr', gap: '20px', alignItems: 'start' }}>
         {/* Liste des hosts */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {hosts.map(h => (
+          {visibleHosts.map(h => (
             <HyperviseurCard
               key={h.id}
               host={{ ...h, info_json: h.info_json || {} }}

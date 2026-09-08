@@ -501,6 +501,82 @@ function SwitchBandwidthCard({ switchName, switchIp }) {
   )
 }
 
+// Carte résumant les VMs de tous les hyperviseurs (les VMs ne sont pas des "équipements"
+// au sens du dashboard - elles vivent dans info_json des hôtes ESXi, donc cette carte a sa
+// propre source de données plutôt que de passer par /stats/overview comme les tuiles ci-dessus).
+function VMsSummaryCard() {
+  const navigate = useNavigate()
+  const [hosts, setHosts] = React.useState([])
+  const [loading, setLoading] = React.useState(true)
+
+  const fetchHosts = React.useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/equipment?type=Hyperviseur`, { headers: authHeader() })
+      if (res.status === 401) { window.location.assign('/login'); return }
+      const data = await res.json().catch(() => [])
+      setHosts(Array.isArray(data) ? data : [])
+    } catch (err) {
+      console.error('Erreur chargement VMs:', err)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  React.useEffect(() => {
+    fetchHosts()
+    const id = setInterval(fetchHosts, 30000)
+    return () => clearInterval(id)
+  }, [fetchHosts])
+
+  if (loading || hosts.length === 0) return null
+
+  const allVms = hosts.flatMap(h => (h.info_json?.vms || []).map(vm => ({ ...vm, hostName: h.name })))
+  if (allVms.length === 0) return null
+
+  const running = allVms.filter(v => v.power_state === 'PoweredOn').length
+  const stopped = allVms.filter(v => v.power_state === 'PoweredOff').length
+  const suspended = allVms.filter(v => v.power_state === 'Suspended').length
+
+  return (
+    <div style={{ marginTop: '24px' }}>
+      <h2 style={{ fontSize: '20px', fontWeight: 'bold', marginBottom: '16px', color: '#1f2937' }}>
+        🖥️ Machines Virtuelles
+      </h2>
+      <div className="card panel" style={{ padding: '20px', cursor: 'pointer' }} onClick={() => navigate('vmware')}>
+        <div style={{ display: 'flex', gap: '16px', marginBottom: '16px', flexWrap: 'wrap' }}>
+          {[
+            { label: 'Total VMs', value: allVms.length, color: '#374151' },
+            { label: 'En cours', value: running, color: '#16a34a' },
+            { label: 'Arrêtées', value: stopped, color: '#dc2626' },
+            { label: 'Suspendues', value: suspended, color: '#d97706' },
+          ].map(k => (
+            <div key={k.label} style={{ flex: 1, minWidth: '110px', textAlign: 'center', padding: '10px', background: '#f8fafc', borderRadius: '8px' }}>
+              <div style={{ fontSize: '24px', fontWeight: '700', color: k.color }}>{k.value}</div>
+              <div style={{ fontSize: '12px', color: '#6b7280' }}>{k.label}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {allVms.slice(0, 8).map((vm, i) => (
+            <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', padding: '6px 10px', background: '#f8fafc', borderRadius: '6px' }}>
+              <span style={{ fontWeight: '500', color: '#1f2937' }}>{vm.name}</span>
+              <span style={{ color: '#9ca3af' }}>{vm.hostName}</span>
+              <span style={{ color: vm.power_state === 'PoweredOn' ? '#16a34a' : '#dc2626', fontWeight: '600' }}>
+                {vm.power_state === 'PoweredOn' ? '● En ligne' : vm.power_state === 'Suspended' ? '● Suspendue' : '● Arrêtée'}
+              </span>
+            </div>
+          ))}
+          {allVms.length > 8 && (
+            <div style={{ fontSize: '12px', color: '#6b7280', textAlign: 'center', marginTop: '4px' }}>
+              + {allVms.length - 8} autre(s) — voir la page VMware
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function LineChart(){
   // État pour les données réelles de bande passante
   const [bandwidthData, setBandwidthData] = React.useState([])
@@ -908,6 +984,9 @@ export default function Home(){
           </div>
         </div>
       )}
+
+      {/* Résumé des VMs (tous les hyperviseurs) - Masqué pour SGM */}
+      {userRole !== 'SGM' && <VMsSummaryCard />}
 
       {/* Barre de recherche pour SGM */}
       {userRole === 'SGM' && <SGMSearchBar />}

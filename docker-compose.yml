@@ -8,6 +8,7 @@ services:
       - JWT_SECRET=${JWT_SECRET:-change-me-please}
       - DB_PATH=./data/app.db
       - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-}
       - ADMIN_SEED_PASSWORD=${ADMIN_SEED_PASSWORD:-}
       - USER_SEED_PASSWORD=${USER_SEED_PASSWORD:-}
     volumes:
@@ -63,7 +64,7 @@ services:
       dockerfile: docker/monitor/Dockerfile
     image: semmaris/monitors:latest
     working_dir: /opt/monitors
-    command: /opt/monitors/CollectSwitchMetrics.ps1
+    command: /opt/monitors/CollectSwitchMetrics.ps1 -Loop -IntervalSeconds 120
     environment:
       - API_URL=http://api:4000
       - INGEST_KEY=${INGEST_KEY:-change-me-strong}
@@ -99,6 +100,37 @@ services:
       - api
     restart: always
 
+  # Connection credentials (vCenter/ESXi or Seagate) are entered via Panel Admin > Intégrations
+  # and fetched from the API each cycle - no secrets baked into the image or compose file.
+  # Both stay idle (retry loop, no error) until something is actually configured.
+  vmware-collector:
+    build:
+      context: .
+      dockerfile: docker/vmware-collector/Dockerfile
+    image: semmaris/vmware-collector:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/CollectHyperviseurInfo.ps1 -Loop -IntervalSeconds 300
+    environment:
+      - API_URL=http://api:4000
+      - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+    depends_on:
+      - api
+    restart: always
+
+  storage-collector:
+    build:
+      context: .
+      dockerfile: docker/monitor/Dockerfile
+    image: semmaris/monitors:latest
+    working_dir: /opt/monitors
+    command: /opt/monitors/CollectStorageInfo.ps1 -Loop -IntervalSeconds 300
+    environment:
+      - API_URL=http://api:4000
+      - INGEST_KEY=${INGEST_KEY:-change-me-strong}
+    depends_on:
+      - api
+    restart: always
+
 # NOT containerized here, on purpose:
 #
 # - CollectServerMetricsV2.ps1 (physical/VM server metrics): its "local" collection path uses
@@ -106,8 +138,3 @@ services:
 #   path talks to other Windows servers over WinRM with a credential prompt. It's architecturally
 #   meant to run on/against Windows hosts, not as a generic Linux container. Keep running it via
 #   scripts/StartAllMonitors.ps1 (or a Scheduled Task) on a Windows host.
-#
-# - CollectHyperviseurInfo.ps1 / CollectStorageInfo.ps1 (VMware/Seagate collectors): need real
-#   vCenter/ESXi/Seagate credentials that aren't configured yet, and VMware.PowerCLI is a large
-#   module to bake into this image for no benefit until those credentials exist. Run these
-#   manually or via a separate Scheduled Task once real infrastructure access is available.

@@ -62,7 +62,12 @@ function Get-AllEquipment {
     param([string]$Token)
     try {
         $headers = @{ Authorization = "Bearer $Token" }
-        return Invoke-RestMethod -Uri "$apiBase/equipment" -Method GET -Headers $headers -ErrorAction Stop
+        $result = Invoke-RestMethod -Uri "$apiBase/equipment" -Method GET -Headers $headers -ErrorAction Stop
+        # Un tableau JSON vide "[]" peut se retrouver deserialise en $null plutot qu'un
+        # tableau vide - on normalise ici pour eviter que @(Get-AllEquipment) ne produise
+        # un tableau a un element contenant $null.
+        if ($null -eq $result) { return @() }
+        return @($result)
     } catch {
         Write-Log "ERROR" "Recuperation des equipements echouee: $_"
         return @()
@@ -117,7 +122,7 @@ while ($true) {
         }
     }
 
-    $equipmentList = @(Get-AllEquipment -Token $token)
+    $equipmentList = @(Get-AllEquipment -Token $token | Where-Object { $_ })
     if ($equipmentList.Count -eq 0) {
         Start-Sleep -Seconds $pollIntervalSeconds
         continue
