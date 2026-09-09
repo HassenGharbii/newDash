@@ -539,6 +539,9 @@ app.post('/users', auth('Admin'), (req,res)=>{
     if (!['Admin','User','SGM'].includes(role)) {
       return res.status(400).json({ error: 'invalid role' });
     }
+    if (!validators.password(password)) {
+      return res.status(400).json({ error: 'password must be at least 6 characters' });
+    }
     const hash = bcrypt.hashSync(password, 10);
     try {
       const info = db.prepare(
@@ -563,6 +566,9 @@ app.put('/users/:id', auth('Admin'), (req,res)=>{
     const { email, password, role, name } = req.body || {};
     if (role && !['Admin','User','SGM'].includes(role)) {
       return res.status(400).json({ error: 'invalid role' });
+    }
+    if (password && !validators.password(password)) {
+      return res.status(400).json({ error: 'password must be at least 6 characters' });
     }
     const user = db.prepare('SELECT id FROM users WHERE id=?').get(id);
     if (!user) return res.status(404).json({ error: 'not found' });

@@ -13,6 +13,11 @@ $adminPassword = $config.adminPassword
 $ingestKey = $config.ingestKey
 $pollIntervalSeconds = 180  # 3 minutes
 
+# Nombre de pings simultanes (PowerShell 7+ uniquement - voir Test-PingAll). Avec un grand
+# parc (ex: >1000 cameras), le ping sequentiel avec retries peut prendre des heures pour un
+# seul cycle ; le parallelisme ramene ca a moins d'une minute.
+$pingThrottleLimit = if ($env:PING_THROTTLE_LIMIT) { [int]$env:PING_THROTTLE_LIMIT } else { 60 }
+
 Write-Host "=== Demarrage SimplePing ===" -ForegroundColor Green
 Write-Host "API: $apiBase"
 Write-Host "Intervalle: $pollIntervalSeconds secondes (3 minutes)"
@@ -104,6 +109,53 @@ function Test-Ping {
     }
 }
 
+# Ping l'ensemble du parc. En PowerShell 7+ (le conteneur Docker), ping en parallele avec
+# ForEach-Object -Parallel - indispensable a grande echelle (des centaines/milliers
+# d'equipements en sequentiel avec retries peut prendre des heures pour un seul cycle).
+# Repli sequentiel (fonction Test-Ping ci-dessus) si execute sous Windows PowerShell 5.1
+# natif, qui ne supporte pas -Parallel.
+function Test-PingAll {
+    param([array]$Equipment, [int]$ThrottleLimit = 60)
+
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
+        return $Equipment | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+            $eq = $_
+            $cleanIp = $eq.ip -replace ':\d+$', ''
+            $status = "DOWN"
+            $latency = $null
+
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                try {
+                    $reply = Test-Connection -ComputerName $cleanIp -Count 1 -TimeoutSeconds 1 -ErrorAction Stop
+                    if ($reply) {
+                        $r = $reply | Select-Object -First 1
+                        $status = "UP"
+                        $latency = 0
+                        if ($r.PSObject.Properties.Name -contains 'Latency' -and $null -ne $r.Latency) {
+                            $latency = [int]$r.Latency
+                        } elseif ($r.PSObject.Properties.Name -contains 'ResponseTime' -and $null -ne $r.ResponseTime) {
+                            $latency = [int]$r.ResponseTime
+                        }
+                        break
+                    }
+                } catch {
+                    # Continuer vers la prochaine tentative
+                }
+                if ($attempt -lt 2) { Start-Sleep -Milliseconds 300 }
+            }
+
+            [PSCustomObject]@{ ip = $eq.ip; status = $status; latency_ms = $latency }
+        }
+    } else {
+        $results = @()
+        foreach ($eq in $Equipment) {
+            $pingResult = Test-Ping -ip $eq.ip
+            $results += [PSCustomObject]@{ ip = $eq.ip; status = $pingResult.status; latency_ms = $pingResult.latency }
+        }
+        return $results
+    }
+}
+
 function Send-PingBatch {
     param([array]$results)
     
@@ -152,46 +204,14 @@ while ($true) {
         continue
     }
     
-    Write-Host "Ping de $($equipment.Count) equipements..."
+    Write-Host "Ping de $($equipment.Count) equipements (parallelisme: $(if ($PSVersionTable.PSVersion.Major -ge 7) { $pingThrottleLimit } else { 'sequentiel, PS5.1' }))..."
     Write-Host "Debut du ping: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor Yellow
-    
-    $upCount = 0
-    $downCount = 0
-    $processed = 0
-    $results = @()  # Stocker tous les resultats avant envoi
-    
-    # Phase 1: Ping tous les equipements (sans envoyer)
-    foreach ($eq in $equipment) {
-        $processed++
-        
-        # Afficher progression tous les 50 equipements
-        if ($processed % 50 -eq 0) {
-            Write-Host "  Progression: $processed/$($equipment.Count) - UP: $upCount, DOWN: $downCount" -ForegroundColor Cyan
-        }
-        
-        # Premier ping - afficher pour debug
-        if ($processed -eq 1) {
-            Write-Host "  Premier ping: $($eq.ip)" -ForegroundColor Yellow
-        }
-        
-        # Ping
-        $pingResult = Test-Ping -ip $eq.ip
-        
-        # Stocker le resultat pour envoi groupé (format compatible JSON)
-        $results += [PSCustomObject]@{
-            ip = $eq.ip
-            status = $pingResult.status
-            latency_ms = $pingResult.latency
-        }
-        
-        if ($pingResult.status -eq "UP") {
-            $upCount++
-        }
-        else {
-            $downCount++
-        }
-    }
-    
+
+    # Phase 1: Ping tous les equipements (sans envoyer) - en parallele si possible
+    $results = @(Test-PingAll -Equipment $equipment -ThrottleLimit $pingThrottleLimit)
+    $upCount = @($results | Where-Object { $_.status -eq 'UP' }).Count
+    $downCount = @($results | Where-Object { $_.status -eq 'DOWN' }).Count
+
     $pingEnd = Get-Date
     $pingDuration = ($pingEnd - $cycleStart).TotalSeconds
     
