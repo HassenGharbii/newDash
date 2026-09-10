@@ -24,7 +24,7 @@ if (-not (Test-Path $ConfigFile)) {
 
 $config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
 $apiBase = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
-$ingestKey = $config.ingestKey
+$ingestKey = if ($env:INGEST_KEY) { $env:INGEST_KEY } else { $config.ingestKey }
 
 # Outil SNMP : net-snmp (snmpget/snmpwalk, multiplateforme) en priorite, sinon SnmpWalk.exe (Windows uniquement)
 $snmpWalkPath = Join-Path $scriptPath "SnmpWalk\SnmpWalk.exe"
@@ -405,25 +405,13 @@ function Get-SwitchMetrics {
     return $metrics
 }
 
-# Fonction d'authentification
-function Get-AuthToken {
-    param($apiBase, $email, $password)
-    $loginUrl = "$apiBase/auth/login"
-    $loginBody = @{ identifier = $email; password = $password } | ConvertTo-Json
-    try {
-        $response = Invoke-RestMethod -Uri $loginUrl -Method POST -Body $loginBody -ContentType "application/json"
-        return $response.token
-    } catch {
-        Write-Warning "Echec authentification: $_"
-        return $null
-    }
-}
-
 # Fonction pour récupérer les switches
+# Utilise la cle d'ingestion (deja fiable et gerable via $env:INGEST_KEY) plutot qu'un
+# compte utilisateur - evite de dependre d'un mot de passe qui peut changer/differer
+# entre config.json et la base de donnees.
 function Get-SwitchesFromAPI {
-    param($Token)
     try {
-        $headers = @{ Authorization = "Bearer $Token" }
+        $headers = @{ "x-ingest-key" = $ingestKey }
         $response = Invoke-RestMethod -Uri "$apiBase/equipment" -Headers $headers -Method GET
         return $response | Where-Object { $_.type -eq 'Switch' }
     } catch {
@@ -459,21 +447,9 @@ function Send-SwitchMetrics {
 # ---------- UN CYCLE DE COLLECTE ----------
 function Invoke-SwitchMetricsCycle {
 
-# Authentification
-Write-Host "[AUTH] Authentification..." -ForegroundColor Yellow
-$token = Get-AuthToken -apiBase $apiBase -email $config.adminEmail -password $config.adminPassword
-
-if (-not $token) {
-    Write-Warning "Impossible de s'authentifier"
-    return
-}
-
-Write-Host "[AUTH] OK" -ForegroundColor Green
-Write-Host ""
-
 # Récupération des switches
 Write-Host "[LOAD] Récupération switches depuis API..." -ForegroundColor Yellow
-$switches = Get-SwitchesFromAPI -Token $token
+$switches = Get-SwitchesFromAPI
 
 if ($switches.Count -eq 0) {
     Write-Warning "Aucun switch trouvé dans la base de données"

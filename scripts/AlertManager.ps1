@@ -36,8 +36,7 @@ if (-not (Test-Path $ConfigPath)) {
 $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 
 $apiBase             = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
-$adminEmail          = $config.adminEmail
-$adminPassword       = $config.adminPassword
+$ingestKey           = if ($env:INGEST_KEY) { $env:INGEST_KEY } else { $config.ingestKey }
 $pollIntervalSeconds = if ($config.pollIntervalSeconds -gt 0) { $config.pollIntervalSeconds } else { 60 }
 $debounceCount       = if ($config.debounceCount -gt 0) { $config.debounceCount } else { 1 }
 $heartbeatSeconds    = if ($config.PSObject.Properties.Name -contains 'heartbeatSeconds') { $config.heartbeatSeconds } else { 0 }
@@ -47,21 +46,12 @@ if (-not $webhookUrl) {
     Write-Log "WARN" "webhookUrl non configure dans config.json - les alertes seront seulement journalisees localement."
 }
 
-function Get-AuthToken {
-    try {
-        $body = @{ identifier = $adminEmail; password = $adminPassword } | ConvertTo-Json
-        $response = Invoke-RestMethod -Uri "$apiBase/auth/login" -Method POST -Body $body -ContentType "application/json" -ErrorAction Stop
-        return $response.token
-    } catch {
-        Write-Log "ERROR" "Authentification echouee: $_"
-        return $null
-    }
-}
-
 function Get-AllEquipment {
-    param([string]$Token)
+    # Utilise la cle d'ingestion (deja fiable et gerable via $env:INGEST_KEY) plutot qu'un
+    # compte utilisateur - evite de dependre d'un mot de passe qui peut changer/differer
+    # entre config.json et la base de donnees.
     try {
-        $headers = @{ Authorization = "Bearer $Token" }
+        $headers = @{ "x-ingest-key" = $ingestKey }
         $result = Invoke-RestMethod -Uri "$apiBase/equipment" -Method GET -Headers $headers -ErrorAction Stop
         # Un tableau JSON vide "[]" peut se retrouver deserialise en $null plutot qu'un
         # tableau vide - on normalise ici pour eviter que @(Get-AllEquipment) ne produise
@@ -110,19 +100,10 @@ function Send-Webhook {
 Write-Log "INFO" "=== Demarrage AlertManager ==="
 Write-Log "INFO" "API: $apiBase | Intervalle: ${pollIntervalSeconds}s | Seuil debounce: $debounceCount panne(s) consecutive(s)"
 
-$token = Get-AuthToken
 $lastHeartbeat = Get-Date
 
 while ($true) {
-    if (-not $token) {
-        $token = Get-AuthToken
-        if (-not $token) {
-            Start-Sleep -Seconds $pollIntervalSeconds
-            continue
-        }
-    }
-
-    $equipmentList = @(Get-AllEquipment -Token $token | Where-Object { $_ })
+    $equipmentList = @(Get-AllEquipment | Where-Object { $_ })
     if ($equipmentList.Count -eq 0) {
         Start-Sleep -Seconds $pollIntervalSeconds
         continue

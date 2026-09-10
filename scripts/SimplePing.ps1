@@ -8,8 +8,6 @@ $configPath = Join-Path $PSScriptRoot "config.json"
 $config = Get-Content $configPath | ConvertFrom-Json
 
 $apiBase = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
-$adminEmail = $config.adminEmail
-$adminPassword = $config.adminPassword
 $ingestKey = if ($env:INGEST_KEY) { $env:INGEST_KEY } else { $config.ingestKey }
 $pollIntervalSeconds = 180  # 3 minutes
 
@@ -23,35 +21,15 @@ Write-Host "API: $apiBase"
 Write-Host "Intervalle: $pollIntervalSeconds secondes (3 minutes)"
 Write-Host ""
 
-function Get-AuthToken {
-    try {
-        $body = @{
-            identifier = $adminEmail
-            password = $adminPassword
-        } | ConvertTo-Json
-
-        $response = Invoke-RestMethod -Uri "$apiBase/auth/login" `
-            -Method POST `
-            -Body $body `
-            -ContentType "application/json" `
-            -ErrorAction Stop
-
-        return $response.token
-    }
-    catch {
-        Write-Host "Erreur authentification: $_" -ForegroundColor Red
-        return $null
-    }
-}
-
 function Get-Equipment {
-    param([string]$token)
-    
+    # Utilise la cle d'ingestion (deja fiable et gerable via $env:INGEST_KEY) plutot qu'un
+    # compte utilisateur - evite de dependre d'un mot de passe qui peut changer/differer
+    # entre config.json et la base de donnees.
     try {
         $headers = @{
-            Authorization = "Bearer $token"
+            "x-ingest-key" = $ingestKey
         }
-        
+
         $response = Invoke-RestMethod -Uri "$apiBase/equipment" `
             -Method GET `
             -Headers $headers `
@@ -206,16 +184,8 @@ while ($true) {
     $cycleStart = Get-Date
     Write-Host "--- Nouveau cycle: $(Get-Date -Format 'HH:mm:ss') ---" -ForegroundColor Cyan
     
-    # Authentification
-    $token = Get-AuthToken
-    if (-not $token) {
-        Write-Host "Impossible de s'authentifier, attente 60s..." -ForegroundColor Red
-        Start-Sleep -Seconds 60
-        continue
-    }
-    
     # Recuperer les equipements
-    $equipment = Get-Equipment -token $token
+    $equipment = Get-Equipment
     if ($equipment.Count -eq 0) {
         Write-Host "Aucun equipement recupere, attente 60s..." -ForegroundColor Red
         Start-Sleep -Seconds 60

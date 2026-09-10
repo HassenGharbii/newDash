@@ -473,6 +473,18 @@ const requireIngestKey = (req, res, next) => {
   next();
 };
 
+// Permet aux scripts de collecte (ping/switch/alertes) de lire les equipements avec la
+// meme cle d'ingestion qu'ils utilisent deja pour envoyer leurs resultats, sans avoir a
+// gerer un compte utilisateur separe dans config.json. Garde aussi l'auth JWT normale
+// pour le frontend.
+const authOrIngestKey = (roles = []) => {
+  const jwtAuth = auth(roles);
+  return (req, res, next) => {
+    if ((req.headers['x-ingest-key'] || '') === config.ingestKey) return next();
+    return jwtAuth(req, res, next);
+  };
+};
+
 // ---------- HEALTH ----------
 app.get('/health', (_req,res)=>res.json({status:'ok'}));
 
@@ -2030,7 +2042,7 @@ app.get('/metrics/switch/:id', auth(['Admin','User']), (req, res) => {
 });
 
 // GET /equipment?type=Camera - Avec données réelles pour les caméras et PCs
-app.get('/equipment', auth(['Admin','User','SGM']), (req, res) => {
+app.get('/equipment', authOrIngestKey(['Admin','User','SGM']), (req, res) => {
   try {
     const type = req.query.type;
 
