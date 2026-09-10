@@ -10,7 +10,7 @@ $config = Get-Content $configPath | ConvertFrom-Json
 $apiBase = if ($env:API_URL) { $env:API_URL } else { $config.apiBase }
 $adminEmail = $config.adminEmail
 $adminPassword = $config.adminPassword
-$ingestKey = $config.ingestKey
+$ingestKey = if ($env:INGEST_KEY) { $env:INGEST_KEY } else { $config.ingestKey }
 $pollIntervalSeconds = 180  # 3 minutes
 
 # Nombre de pings simultanes (PowerShell 7+ uniquement - voir Test-PingAll). Avec un grand
@@ -80,15 +80,24 @@ function Test-Ping {
             $reply = Test-Connection -ComputerName $cleanIp -Count 1 -ErrorAction Stop
             if ($reply) {
                 $r = $reply | Select-Object -First 1
-                $latency = 0
-                if ($r.PSObject.Properties.Name -contains 'Latency' -and $null -ne $r.Latency) {
-                    $latency = [int]$r.Latency
-                } elseif ($r.PSObject.Properties.Name -contains 'ResponseTime' -and $null -ne $r.ResponseTime) {
-                    $latency = [int]$r.ResponseTime
+                # PowerShell 7+ renvoie TOUJOURS un objet, meme en echec (Status=TimedOut
+                # au lieu de lever une erreur) - il faut verifier Status, pas juste la
+                # presence d'un objet, sinon tout remonte "UP" a tort.
+                $success = $true
+                if ($r.PSObject.Properties.Name -contains 'Status') {
+                    $success = ($r.Status -eq 'Success')
                 }
-                return @{
-                    status = "UP"
-                    latency = $latency
+                if ($success) {
+                    $latency = 0
+                    if ($r.PSObject.Properties.Name -contains 'Latency' -and $null -ne $r.Latency) {
+                        $latency = [int]$r.Latency
+                    } elseif ($r.PSObject.Properties.Name -contains 'ResponseTime' -and $null -ne $r.ResponseTime) {
+                        $latency = [int]$r.ResponseTime
+                    }
+                    return @{
+                        status = "UP"
+                        latency = $latency
+                    }
                 }
             }
         }
@@ -129,14 +138,23 @@ function Test-PingAll {
                     $reply = Test-Connection -ComputerName $cleanIp -Count 1 -TimeoutSeconds 1 -ErrorAction Stop
                     if ($reply) {
                         $r = $reply | Select-Object -First 1
-                        $status = "UP"
-                        $latency = 0
-                        if ($r.PSObject.Properties.Name -contains 'Latency' -and $null -ne $r.Latency) {
-                            $latency = [int]$r.Latency
-                        } elseif ($r.PSObject.Properties.Name -contains 'ResponseTime' -and $null -ne $r.ResponseTime) {
-                            $latency = [int]$r.ResponseTime
+                        # PowerShell 7 renvoie TOUJOURS un objet, meme en echec
+                        # (Status=TimedOut) - il faut verifier Status, pas juste la
+                        # presence d'un objet, sinon tout remonte "UP" a tort.
+                        $success = $true
+                        if ($r.PSObject.Properties.Name -contains 'Status') {
+                            $success = ($r.Status -eq 'Success')
                         }
-                        break
+                        if ($success) {
+                            $status = "UP"
+                            $latency = 0
+                            if ($r.PSObject.Properties.Name -contains 'Latency' -and $null -ne $r.Latency) {
+                                $latency = [int]$r.Latency
+                            } elseif ($r.PSObject.Properties.Name -contains 'ResponseTime' -and $null -ne $r.ResponseTime) {
+                                $latency = [int]$r.ResponseTime
+                            }
+                            break
+                        }
                     }
                 } catch {
                     # Continuer vers la prochaine tentative
