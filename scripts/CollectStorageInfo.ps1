@@ -233,144 +233,123 @@ function Invoke-SeagateSSHCommand {
         $output = & sshpass -p $ApiPass ssh `
             -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 `
             "$ApiUser@$StorageIp" "$Command" 2>&1
-        return ($output -join "`n")
+        $text = ($output -join "`n")
+        # En SSH non-interactif (sans pty), le CLI Seagate repond en XML plutot qu'en
+        # tableau texte - beaucoup plus fiable a parser. On retire tout texte parasite
+        # avant la declaration XML (invite "# show ...", bannieres) et apres (invite "#").
+        $xmlStart = $text.IndexOf('<?xml')
+        if ($xmlStart -lt 0) { $xmlStart = $text.IndexOf('<RESPONSE') }
+        if ($xmlStart -ge 0) { $text = $text.Substring($xmlStart) }
+        $xmlEnd = $text.LastIndexOf('</RESPONSE>')
+        if ($xmlEnd -ge 0) { $text = $text.Substring(0, $xmlEnd + '</RESPONSE>'.Length) }
+        return $text
     } catch {
         Write-Log "WARN" "$StorageIp : commande SSH '$Command' échouée : $($_.Exception.Message)"
         return $null
     }
 }
 
-# "show system" : paires "Label: Valeur", une par ligne
-function ConvertFrom-SeagateSystemText {
-    param([string]$Text)
+# Convertit un noeud <OBJECT basetype="..."><PROPERTY name="x">valeur</PROPERTY>...</OBJECT>
+# en hashtable { x = valeur }. Format commun a toutes les reponses XML du CLI Seagate.
+function ConvertFrom-SeagateObjectNode {
+    param($ObjectNode)
     $info = @{}
-    foreach ($line in ($Text -split "`n")) {
-        if ($line -match '^([^:]+):\s*(.*)$') {
-            $info[$Matches[1].Trim()] = $Matches[2].Trim()
-        }
+    foreach ($prop in @($ObjectNode.PROPERTY)) {
+        if ($prop -and $prop.name) { $info[$prop.name] = $prop.InnerText }
     }
     return $info
 }
 
-# "show disks" : tableau sur 2 lignes par disque (ligne 1 = "0.0  serial  vendor ... taille",
-# ligne 2 indentee = "sec-fmt  disk-group  pool  tier  fips  health"). On ancre sur le
-# numero d'emplacement en debut de ligne 1 et la sante en fin de ligne 2 - robuste meme si
-# les colonnes du milieu varient en largeur.
-function ConvertFrom-SeagateDisksText {
-    param([string]$Text)
-    $lines = $Text -split "`n"
-    $total = 0; $ok = 0; $failed = 0; $rebuilding = 0
-
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^\d+\.\d+\s') {
-            $total++
-            if ($i + 1 -lt $lines.Count) {
-                $tokens = ($lines[$i + 1].Trim()) -split '\s+'
-                $health = $tokens[$tokens.Count - 1]
-                if ($health -eq 'OK') { $ok++ }
-                elseif ($health -match 'REBUILD|REGEN') { $rebuilding++ }
-                elseif ($health -and $health -ne 'N/A') { $failed++ }
-            }
-        }
-    }
-    return @{ total = $total; ok = $ok; failed = $failed; rebuilding = $rebuilding }
-}
-
 function Convert-SeagateSizeToTB {
-    param([double]$Value, [string]$Unit)
-    switch ($Unit) {
-        'TiB' { return $Value }
-        'GiB' { return $Value / 1024 }
-        'MiB' { return $Value / 1024 / 1024 }
-        'B'   { return $Value / 1024 / 1024 / 1024 / 1024 }
-        default { return $Value }
+    param([string]$SizeText)
+    if (-not $SizeText) { return 0.0 }
+    if ($SizeText -notmatch '^([\d,\.]+)\s*(TiB|GiB|MiB|KiB|B)$') { return 0.0 }
+    $value = [double]($Matches[1] -replace ',', '.')
+    switch ($Matches[2]) {
+        'TiB' { return $value }
+        'GiB' { return $value / 1024 }
+        'MiB' { return $value / 1024 / 1024 }
+        'KiB' { return $value / 1024 / 1024 / 1024 }
+        'B'   { return $value / 1024 / 1024 / 1024 / 1024 }
+        default { return $value }
     }
 }
 
-# "show pools" : meme principe 2-lignes. Ligne 1 commence par "<Lettre> <numero-serie-32hex>"
-# et contient au moins 2 tailles ("Total Size" puis "Avail") ; ligne 2 se termine par la sante.
-function ConvertFrom-SeagatePoolsText {
+function ConvertFrom-SeagateXmlText {
     param([string]$Text)
-    $lines = $Text -split "`n"
-    $pools = @()
-    $totalTB = 0.0; $availTB = 0.0
-    $sizeRegex = [regex]'([\d,]+)\s*(TiB|GiB|MiB|B)\b'
-
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^([A-Z])\s+[0-9a-f]{32}\s') {
-            $poolName = $Matches[1]
-            $sizeMatches = $sizeRegex.Matches($lines[$i])
-            if ($sizeMatches.Count -ge 2) {
-                $totalPoolTB = Convert-SeagateSizeToTB `
-                    -Value ([double]($sizeMatches[0].Groups[1].Value -replace ',', '.')) `
-                    -Unit $sizeMatches[0].Groups[2].Value
-                $availPoolTB = Convert-SeagateSizeToTB `
-                    -Value ([double]($sizeMatches[1].Groups[1].Value -replace ',', '.')) `
-                    -Unit $sizeMatches[1].Groups[2].Value
-
-                $totalTB += $totalPoolTB
-                $availTB += $availPoolTB
-
-                $health = 'OK'
-                if ($i + 1 -lt $lines.Count) {
-                    $contTokens = ($lines[$i + 1].Trim()) -split '\s+'
-                    $health = $contTokens[$contTokens.Count - 1]
-                }
-
-                $pools += @{
-                    name        = $poolName
-                    raid_level  = "Virtuel"
-                    capacity_gb = [math]::Round($totalPoolTB * 1024, 0)
-                    used_gb     = [math]::Round(($totalPoolTB - $availPoolTB) * 1024, 0)
-                    health      = $health
-                }
-            }
-        }
-    }
-    return @{
-        pools    = $pools
-        total_tb = [math]::Round($totalTB, 2)
-        avail_tb = [math]::Round($availTB, 2)
-        used_tb  = [math]::Round($totalTB - $availTB, 2)
-    }
+    try { return [xml]$Text } catch { return $null }
 }
 
 function Collect-SeagateSSH {
     param([string]$StorageIp)
 
     $sysText = Invoke-SeagateSSHCommand -StorageIp $StorageIp -Command "show system"
-    if (-not $sysText -or $sysText -notmatch 'Health') {
-        Write-Log "WARN" "$StorageIp : SSH indisponible ou reponse inattendue"
+    $sysXml = if ($sysText) { ConvertFrom-SeagateXmlText -Text $sysText } else { $null }
+    if (-not $sysXml) {
+        Write-Log "WARN" "$StorageIp : SSH indisponible ou reponse XML invalide"
         return $null
     }
-    $sys = ConvertFrom-SeagateSystemText -Text $sysText
+    $sysNode = @($sysXml.RESPONSE.OBJECT) | Where-Object { $_.basetype -eq 'system' } | Select-Object -First 1
+    $sys = if ($sysNode) { ConvertFrom-SeagateObjectNode -ObjectNode $sysNode } else { @{} }
 
+    # Disques : chaque disque est un OBJECT basetype="drives"
     $disksText = Invoke-SeagateSSHCommand -StorageIp $StorageIp -Command "show disks"
-    $disks = if ($disksText) { ConvertFrom-SeagateDisksText -Text $disksText } else { @{ total=0; ok=0; failed=0; rebuilding=0 } }
-
-    $poolsText = Invoke-SeagateSSHCommand -StorageIp $StorageIp -Command "show pools"
-    $poolsInfo = if ($poolsText) { ConvertFrom-SeagatePoolsText -Text $poolsText } else { @{ pools=@(); total_tb=0; avail_tb=0; used_tb=0 } }
-
-    $health = if ($sys.ContainsKey('Health')) { $sys['Health'] } else { 'Unknown' }
-    $data = @{
-        ip                 = $StorageIp
-        name               = $(if ($sys['System Name'] -and $sys['System Name'] -ne 'Uninitialized Name') { $sys['System Name'] } else { "Seagate-$StorageIp" })
-        model              = $(if ($sys['Product Brand']) { "$($sys['Product Brand']) $($sys['Product ID'])" } else { "Seagate Exos X" })
-        serial_number      = $(if ($sys['Midplane Serial Number']) { $sys['Midplane Serial Number'] } else { "" })
-        health             = $health
-        overall_status     = if ($health -eq 'OK') { "OK" } else { "Fault" }
-        capacity_total_tb  = $poolsInfo.total_tb
-        capacity_used_tb   = $poolsInfo.used_tb
-        capacity_free_tb   = $poolsInfo.avail_tb
-        disks_total        = $disks.total
-        disks_ok           = $disks.ok
-        disks_failed       = $disks.failed
-        disks_rebuilding   = $disks.rebuilding
-        pools              = $poolsInfo.pools
-        volumes_count      = $poolsInfo.pools.Count
+    $disksXml = if ($disksText) { ConvertFrom-SeagateXmlText -Text $disksText } else { $null }
+    $disksTotal = 0; $disksOk = 0; $disksFailed = 0; $disksRebuilding = 0
+    if ($disksXml) {
+        $driveNodes = @($disksXml.RESPONSE.OBJECT) | Where-Object { $_.basetype -eq 'drives' }
+        $disksTotal = $driveNodes.Count
+        foreach ($node in $driveNodes) {
+            $d = ConvertFrom-SeagateObjectNode -ObjectNode $node
+            $h = $d['health']
+            if ($h -eq 'OK') { $disksOk++ }
+            elseif ($h -match 'REBUILD|REGEN') { $disksRebuilding++ }
+            elseif ($h -and $h -ne 'N/A') { $disksFailed++ }
+        }
     }
 
-    Write-Log "INFO" "SSH collecté $StorageIp : santé=$health | $($data.capacity_total_tb) TiB | $($disks.total) disques"
+    # Pools : chaque pool est un OBJECT basetype="pools"
+    $poolsText = Invoke-SeagateSSHCommand -StorageIp $StorageIp -Command "show pools"
+    $poolsXml = if ($poolsText) { ConvertFrom-SeagateXmlText -Text $poolsText } else { $null }
+    $pools = @(); $totalTB = 0.0; $availTB = 0.0
+    if ($poolsXml) {
+        $poolNodes = @($poolsXml.RESPONSE.OBJECT) | Where-Object { $_.basetype -eq 'pools' }
+        foreach ($node in $poolNodes) {
+            $p = ConvertFrom-SeagateObjectNode -ObjectNode $node
+            $poolTotalTB = Convert-SeagateSizeToTB -SizeText $p['total-size']
+            $poolAvailTB = Convert-SeagateSizeToTB -SizeText $p['total-avail']
+            $totalTB += $poolTotalTB
+            $availTB += $poolAvailTB
+            $pools += @{
+                name        = $p['name']
+                raid_level  = $(if ($p['storage-type']) { $p['storage-type'] } else { "Virtuel" })
+                capacity_gb = [math]::Round($poolTotalTB * 1024, 0)
+                used_gb     = [math]::Round(($poolTotalTB - $poolAvailTB) * 1024, 0)
+                health      = $(if ($p['health']) { $p['health'] } else { "OK" })
+            }
+        }
+    }
+
+    $health = if ($sys['health']) { $sys['health'] } else { 'Unknown' }
+    $data = @{
+        ip                 = $StorageIp
+        name               = $(if ($sys['system-name'] -and $sys['system-name'] -ne 'Uninitialized Name') { $sys['system-name'] } else { "Seagate-$StorageIp" })
+        model              = $(if ($sys['product-brand']) { "$($sys['product-brand']) $($sys['product-id'])" } else { "Seagate Exos X" })
+        serial_number      = $(if ($sys['midplane-serial-number']) { $sys['midplane-serial-number'] } else { "" })
+        health             = $health
+        overall_status     = if ($health -eq 'OK') { "OK" } else { "Fault" }
+        capacity_total_tb  = [math]::Round($totalTB, 2)
+        capacity_used_tb   = [math]::Round($totalTB - $availTB, 2)
+        capacity_free_tb   = [math]::Round($availTB, 2)
+        disks_total        = $disksTotal
+        disks_ok           = $disksOk
+        disks_failed       = $disksFailed
+        disks_rebuilding   = $disksRebuilding
+        pools              = $pools
+        volumes_count      = $pools.Count
+    }
+
+    Write-Log "INFO" "SSH collecté $StorageIp : santé=$health | $($data.capacity_total_tb) TiB | $disksTotal disques"
     return $data
 }
 
